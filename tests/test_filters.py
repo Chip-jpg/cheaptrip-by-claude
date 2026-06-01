@@ -1,0 +1,100 @@
+"""Tests for filtering, deduplication, and time decay."""
+from __future__ import annotations
+
+from datetime import date, datetime, timedelta
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from filters.hard_filters import apply_hard_filters
+from filters.time_decay import apply_time_decay
+from storage.models import AlertTier, DealType, FlightLeg, Trip
+
+
+def _make_flight_trip(
+    origin: str,
+    dest: str,
+    cost: float,
+    confidence: float = 0.8,
+    scraped_age_hours: float = 0.0,
+) -> Trip:
+    scraped_at = datetime.utcnow() - timedelta(hours=scraped_age_hours)
+    leg = FlightLeg(
+        origin=origin,
+        destination=dest,
+        price_eur=cost,
+        departure_date=date(2025, 8, 1),
+        source="test",
+        data_confidence_score=confidence,
+        scraped_at=scraped_at,
+    )
+    trip = Trip(
+        deal_type=DealType.FLIGHT_ONLY,
+        route=f"{origin} → {dest}",
+        outbound_flight=leg,
+        flight_cost_eur=cost,
+        total_cost_eur=cost,
+        departure_date=date(2025, 8, 1),
+        data_confidence_score=confidence,
+        source_list=["test"],
+    )
+    trip.hash = trip.compute_hash()
+    return trip
+
+
+class TestHardFilters:
+    def test_cheap_europe_trip_is_instant(self):
+        trip = _make_flight_trip("MXP", "KRK", 85.0)
+        instant, digest = apply_hard_filters([trip])
+        assert len(instant) == 1
+        assert instant[0].alert_tier == AlertTier.INSTANT
+
+    def test_expensive_europe_trip_goes_to_digest(self):
+        trip = _make_flight_trip("MXP", "KRK", 250.0)
+        instant, digest = apply_hard_filters([trip])
+        assert len(instant) == 0
+        assert len(digest) == 1
+
+    def test_very_expensive_trip_is_discarded(self):
+        trip = _make_flight_trip("MXP", "KRK", 999.0)
+        instant, digest = apply_hard_filters([trip])
+        assert len(instant) == 0
+        assert len(digest) == 0
+
+    def test_cheap_longhaul_is_instant(self):
+        trip = _make_flight_trip("MXP", "JFK", 320.0)
+        instant, digest = apply_hard_filters([trip])
+        assert len(instant) == 1
+
+    def test_zero_cost_discarded(self):
+        trip = _make_flight_trip("MXP", "KRK", 0.0)
+        instant, digest = apply_hard_filters([trip])
+        assert len(instant) == 0
+        assert len(digest) == 0
+
+
+class TestTimeDecay:
+    def test_fresh_instant_stays_instant(self):
+        trip = _make_flight_trip("MXP", "KRK", 85.0, scraped_age_hours=1.0)
+        trip.alert_tier = AlertTier.INSTANT
+        instant, digest, archive = apply_time_decay([trip])
+        assert len(instant) == 1
+
+    def test_stale_instant_moves_to_digest(self):
+        trip = _make_flight_trip("MXP", "KRK", 85.0, scraped_age_hours=10.0)
+        trip.alert_tier = AlertTier.INSTANT
+        instant, digest, archive = apply_time_decay([trip])
+        assert len(instant) == 0
+        assert len(digest) == 1
+
+    def test_old_deal_goes_to_archive(self):
+        trip = _make_flight_trip("MXP", "KRK", 85.0, scraped_age_hours=30.0)
+        trip.alert_tier = AlertTier.INSTANT
+        instant, digest, archive = apply_time_decay([trip])
+        assert len(archive) == 1
+
+    def test_digest_tier_unaffected_within_24h(self):
+        trip = _make_flight_trip("MXP", "KRK", 200.0, scraped_age_hours=8.0)
+        trip.alert_tier = AlertTier.DIGEST
+        instant, digest, archive = apply_time_decay([trip])
+        assert len(digest) == 1

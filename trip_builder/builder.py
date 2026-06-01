@@ -1,0 +1,236 @@
+from __future__ import annotations
+
+import uuid
+from datetime import date
+from typing import List, Optional
+
+from config import LAYER_1_AIRPORTS, LAYER_2_AIRPORTS, LAYER_3_HUBS
+from storage.database import get_price_median, record_price
+from storage.models import (
+    AlertTier,
+    DealType,
+    FlightLeg,
+    HotelDeal,
+    Trip,
+)
+from trip_builder.cost_calculator import (
+    assign_verdict,
+    calculate_trip_total,
+    compute_discount_pct,
+    estimate_normal_price,
+)
+from trip_builder.repositioning import find_repositioning_opportunities
+from utils.confidence import compute_trip_confidence
+from utils.logging_config import get_logger
+
+log = get_logger(__name__)
+
+_EUROPE_DESTINATIONS = {
+    "KRK", "WAW", "PRG", "BUD", "LIS", "ATH", "DUB", "CPH", "ARN", "HEL", "OSL",
+    "VIE", "ZRH", "BRU", "EDI", "GVA", "NCE", "MRS", "OPO", "SEV", "MAH", "IBZ",
+    "PMI", "TFS", "ACE", "LPA", "LHR", "LGW", "AMS", "CDG", "FRA", "MAD", "BCN",
+    "FCO", "CIA", "MXP", "LIN", "BGY", "VCE", "VRN", "BLQ",
+}
+
+
+def _is_europe(airport: str) -> bool:
+    return airport in _EUROPE_DESTINATIONS
+
+
+def _make_route_string(origin: str, dest: str, hub: Optional[str] = None) -> str:
+    city_map = {
+        "MXP": "Milan", "LIN": "Milan", "BGY": "Milan",
+        "FCO": "Rome", "CIA": "Rome", "VCE": "Venice",
+        "LHR": "London", "LGW": "London",
+    }
+    o = city_map.get(origin, origin)
+    d = city_map.get(dest, dest)
+    if hub:
+        h = city_map.get(hub, hub)
+        return f"{o} → {h} → {d}"
+    return f"{o} → {d}"
+
+
+async def build_trips(
+    flight_legs: List[FlightLeg],
+    hotel_deals: List[HotelDeal],
+) -> List[Trip]:
+    """
+    Core trip assembly. Produces:
+    1. Flight-only deals (direct)
+    2. Complete trips (flight + hotel)
+    3. Repositioned multi-leg trips
+    """
+    trips: List[Trip] = []
+
+    # Record prices for historical tracking
+    for leg in flight_legs:
+        route = f"{leg.origin}-{leg.destination}"
+        await record_price(route, leg.price_eur, leg.source)
+
+    # ── 1. Direct flight-only deals ──────────────────────────────────────────
+    for leg in flight_legs:
+        if leg.origin not in (LAYER_1_AIRPORTS + LAYER_2_AIRPORTS + LAYER_3_HUBS):
+            continue
+
+        trip = await _build_flight_only_trip(leg)
+        if trip:
+            trips.append(trip)
+
+    # ── 2. Complete trip (flight + hotel) ────────────────────────────────────
+    # Index hotels by destination city
+    hotel_by_dest: dict[str, List[HotelDeal]] = {}
+    from normalizers.currency import AIRPORT_TO_CITY
+    for hotel in hotel_deals:
+        for airport, city in AIRPORT_TO_CITY.items():
+            if city.lower() in hotel.location.lower():
+                hotel_by_dest.setdefault(airport, []).append(hotel)
+
+    for leg in flight_legs:
+        if leg.origin not in (LAYER_1_AIRPORTS + LAYER_2_AIRPORTS):
+            continue
+        dest_hotels = hotel_by_dest.get(leg.destination, [])
+        for hotel in dest_hotels[:3]:  # top 3 cheapest hotels per destination
+            trip = await _build_complete_trip(leg, hotel)
+            if trip:
+                trips.append(trip)
+
+    # ── 3. Repositioned trips ────────────────────────────────────────────────
+    repo_opportunities = find_repositioning_opportunities(flight_legs)
+    for repo_leg, onward_flight, total_cost in repo_opportunities:
+        trip = await _build_repositioned_trip(repo_leg, onward_flight, total_cost)
+        if trip:
+            trips.append(trip)
+
+    log.info("trips_built", count=len(trips))
+    return trips
+
+
+async def _build_flight_only_trip(leg: FlightLeg) -> Optional[Trip]:
+    route = _make_route_string(leg.origin, leg.destination)
+    median = await get_price_median(f"{leg.origin}-{leg.destination}")
+    normal = estimate_normal_price(route, median, None, 0)
+    discount = compute_discount_pct(leg.price_eur, normal)
+    is_europe = _is_europe(leg.destination)
+
+    verdict = assign_verdict(leg.price_eur, discount, leg.data_confidence_score, is_europe)
+
+    trip = Trip(
+        trip_id=str(uuid.uuid4())[:8],
+        deal_type=DealType.FLIGHT_ONLY,
+        route=route,
+        outbound_flight=leg,
+        flight_cost_eur=leg.price_eur,
+        normal_price_eur=normal,
+        discount_pct=discount,
+        departure_date=leg.departure_date,
+        return_date=leg.return_date,
+        data_confidence_score=leg.data_confidence_score,
+        source_list=[leg.source],
+        verdict=verdict,
+    )
+    trip.compute_totals()
+    trip.alert_tier = _assign_alert_tier(trip)
+    trip.hash = trip.compute_hash()
+
+    # Flag potential error fares
+    if normal and leg.price_eur < normal * 0.40:
+        trip.is_error_fare = True
+        trip.deal_type = DealType.ERROR_FARE
+        trip.alert_tier = AlertTier.INSTANT
+
+    return trip
+
+
+async def _build_complete_trip(leg: FlightLeg, hotel: HotelDeal) -> Optional[Trip]:
+    nights = hotel.nights
+    route = _make_route_string(leg.origin, leg.destination)
+
+    flight_median = await get_price_median(f"{leg.origin}-{leg.destination}")
+    total_cost = calculate_trip_total(leg, None, hotel, [])
+    normal = estimate_normal_price(route, flight_median, None, nights)
+
+    discount = compute_discount_pct(total_cost, normal)
+    is_europe = _is_europe(leg.destination)
+    confidence = compute_trip_confidence([leg.data_confidence_score, hotel.data_confidence_score])
+    verdict = assign_verdict(total_cost, discount, confidence, is_europe)
+
+    trip = Trip(
+        trip_id=str(uuid.uuid4())[:8],
+        deal_type=DealType.COMPLETE_TRIP,
+        route=route,
+        outbound_flight=leg,
+        hotel=hotel,
+        flight_cost_eur=leg.price_eur,
+        hotel_cost_eur=hotel.total_price_eur,
+        total_cost_eur=total_cost,
+        normal_price_eur=normal,
+        discount_pct=discount,
+        departure_date=leg.departure_date,
+        return_date=leg.return_date,
+        nights=nights,
+        data_confidence_score=confidence,
+        source_list=list({leg.source, hotel.source}),
+        verdict=verdict,
+    )
+    trip.alert_tier = _assign_alert_tier(trip)
+    trip.hash = trip.compute_hash()
+    return trip
+
+
+async def _build_repositioned_trip(
+    repo_leg,
+    onward_flight: FlightLeg,
+    total_cost: float,
+) -> Optional[Trip]:
+    route = _make_route_string(repo_leg.origin, onward_flight.destination, repo_leg.hub)
+    is_europe = _is_europe(onward_flight.destination)
+
+    confidence = compute_trip_confidence(
+        [repo_leg.data_confidence_score, onward_flight.data_confidence_score]
+    )
+    verdict = assign_verdict(total_cost, None, confidence, is_europe)
+
+    trip = Trip(
+        trip_id=str(uuid.uuid4())[:8],
+        deal_type=DealType.REPOSITIONED,
+        route=route,
+        outbound_flight=onward_flight,
+        repositioning_legs=[repo_leg],
+        flight_cost_eur=onward_flight.price_eur,
+        repositioning_cost_eur=repo_leg.price_eur,
+        total_cost_eur=total_cost,
+        departure_date=onward_flight.departure_date,
+        return_date=onward_flight.return_date,
+        data_confidence_score=confidence,
+        source_list=list({repo_leg.source, onward_flight.source}),
+        verdict=verdict,
+    )
+    trip.alert_tier = _assign_alert_tier(trip)
+    trip.hash = trip.compute_hash()
+    return trip
+
+
+def _assign_alert_tier(trip: Trip) -> AlertTier:
+    from config import get_settings
+    settings = get_settings()
+
+    cost = trip.total_cost_eur
+    is_europe = _is_europe(
+        trip.outbound_flight.destination if trip.outbound_flight else ""
+    )
+
+    # Instant alert conditions (from spec)
+    if is_europe and cost < settings.europe_trip_max_eur:
+        return AlertTier.INSTANT
+    if not is_europe and cost < settings.longhaul_trip_max_eur:
+        return AlertTier.INSTANT
+    if trip.discount_pct and trip.discount_pct >= settings.hotel_discount_min_pct and trip.deal_type == DealType.HOTEL_ONLY:
+        return AlertTier.INSTANT
+    if trip.discount_pct and trip.discount_pct >= settings.flight_discount_min_pct and trip.deal_type == DealType.FLIGHT_ONLY:
+        return AlertTier.INSTANT
+    if trip.is_error_fare:
+        return AlertTier.INSTANT
+
+    # Digest window (6–24h): all deals initially get DIGEST, time decay handles demotion
+    return AlertTier.DIGEST
