@@ -4,6 +4,8 @@ import asyncio
 import functools
 from typing import Any, Callable, Optional, Tuple, Type
 
+import logging as _logging
+
 from tenacity import (
     AsyncRetrying,
     RetryError,
@@ -33,7 +35,7 @@ def async_retry(
                 stop=stop_after_attempt(max_attempts),
                 wait=wait_exponential(multiplier=1, min=min_wait, max=max_wait),
                 retry=retry_if_exception_type(retry_on),
-                before_sleep=before_sleep_log(log, "warning"),
+                before_sleep=before_sleep_log(log, _logging.WARNING),
                 reraise=False,
             ):
                 with attempt:
