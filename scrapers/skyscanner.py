@@ -31,6 +31,63 @@ _FLIGHT_SEARCH_PATHS = [
     "/search",
 ]
 
+_IATA_TO_CITY: Dict[str, str] = {
+    "LHR": "London", "LGW": "London", "STN": "London", "LTN": "London",
+    "CDG": "Paris", "ORY": "Paris",
+    "FCO": "Rome", "CIA": "Rome",
+    "JFK": "New York", "EWR": "Newark",
+    "NRT": "Tokyo", "HND": "Tokyo",
+    "AMS": "Amsterdam", "FRA": "Frankfurt",
+    "MAD": "Madrid", "BCN": "Barcelona",
+    "DUB": "Dublin", "CPH": "Copenhagen",
+    "ARN": "Stockholm", "HEL": "Helsinki",
+    "OSL": "Oslo", "VIE": "Vienna",
+    "ZRH": "Zurich", "BRU": "Brussels",
+    "EDI": "Edinburgh", "GVA": "Geneva",
+    "NCE": "Nice", "MRS": "Marseille",
+    "OPO": "Porto", "LIS": "Lisbon",
+    "ATH": "Athens", "BUD": "Budapest",
+    "PRG": "Prague", "WAW": "Warsaw",
+    "KRK": "Krakow", "MXP": "Milan",
+    "LIN": "Milan", "BGY": "Milan",
+    "VCE": "Venice", "VRN": "Verona",
+    "BLQ": "Bologna", "PMI": "Palma",
+    "IBZ": "Ibiza", "TFS": "Tenerife",
+    "ACE": "Lanzarote", "LPA": "Gran Canaria",
+    "LAX": "Los Angeles", "MIA": "Miami",
+    "ORD": "Chicago", "BOS": "Boston",
+    "YYZ": "Toronto", "YVR": "Vancouver",
+    "ICN": "Seoul", "HKG": "Hong Kong",
+    "BKK": "Bangkok", "SIN": "Singapore",
+    "KUL": "Kuala Lumpur", "DXB": "Dubai",
+    "DOH": "Doha", "TLV": "Tel Aviv",
+    "GRU": "Sao Paulo", "EZE": "Buenos Aires",
+    "SYD": "Sydney", "MEL": "Melbourne",
+    "AKL": "Auckland", "NBO": "Nairobi",
+    "JNB": "Johannesburg", "CPT": "Cape Town",
+    "MAH": "Menorca", "GRO": "Girona",
+    "SEV": "Seville", "CAI": "Cairo",
+    "BOG": "Bogota", "LIM": "Lima",
+    "SCL": "Santiago", "CGK": "Jakarta",
+    "AUH": "Abu Dhabi",
+}
+
+
+def _deep_find_entity_id(obj: object) -> Optional[str]:
+    """Recursively search a dict for any key named 'entityId' or 'entity_id'."""
+    if not isinstance(obj, dict):
+        return None
+    for key in ("entityId", "entity_id"):
+        val = obj.get(key)
+        if val is not None and str(val).strip():
+            return str(val)
+    for val in obj.values():
+        if isinstance(val, dict):
+            found = _deep_find_entity_id(val)
+            if found:
+                return found
+    return None
+
 
 class SkyscannerScraper(BaseFlightScraper):
     """Skyscanner via RapidAPI.
@@ -56,6 +113,7 @@ class SkyscannerScraper(BaseFlightScraper):
         self._probed = False
         self.enabled = bool(self._key)
         self._logged_sample = False
+        self._logged_airport_sample = False
 
     def _headers(self) -> dict:
         return {
@@ -87,11 +145,27 @@ class SkyscannerScraper(BaseFlightScraper):
         if not self._airport_endpoint:
             return None
 
+        entity_id = await self._try_resolve(client, iata)
+        if entity_id:
+            self._entity_cache[iata] = entity_id
+            return entity_id
+
+        city = _IATA_TO_CITY.get(iata)
+        if city:
+            entity_id = await self._try_resolve(client, city)
+            if entity_id:
+                self._entity_cache[iata] = entity_id
+                return entity_id
+
+        log.debug("skyscanner_entity_not_found", iata=iata)
+        return None
+
+    async def _try_resolve(self, client: httpx.AsyncClient, query: str) -> Optional[str]:
         url = f"https://{self._host}{self._airport_endpoint}"
         try:
             resp = await client.get(
                 url,
-                params={"query": iata, "locale": "en-US"},
+                params={"query": query, "locale": "en-US"},
                 headers=self._headers(),
             )
             if resp.status_code != 200:
@@ -99,45 +173,36 @@ class SkyscannerScraper(BaseFlightScraper):
             data = resp.json()
             places = data.get("data") or data.get("results") or data.get("places") or []
 
+            if not self._logged_airport_sample:
+                self._logged_airport_sample = True
+                preview = str(places[0])[:400] if places else "empty"
+                log.info("skyscanner_airport_sample", query=query, count=len(places), preview=preview)
+
             for place in places:
-                entity_id = self._extract_entity_id(place, iata)
-                if entity_id:
-                    self._entity_cache[iata] = entity_id
-                    return entity_id
+                sky_id = (
+                    place.get("skyId")
+                    or place.get("iata")
+                    or place.get("id", "")
+                )
+                if sky_id.upper() == query.upper():
+                    entity_id = _deep_find_entity_id(place)
+                    if entity_id:
+                        return entity_id
+
+                nav = place.get("navigation", {})
+                nav_sky = nav.get("relevantFlightParams", {}).get("skyId", "")
+                if nav_sky.upper() == query.upper():
+                    entity_id = _deep_find_entity_id(place)
+                    if entity_id:
+                        return entity_id
 
             if places:
-                entity_id = self._extract_entity_id(places[0])
+                entity_id = _deep_find_entity_id(places[0])
                 if entity_id:
-                    self._entity_cache[iata] = entity_id
                     return entity_id
+
         except Exception as exc:
-            log.debug("skyscanner_resolve_failed", iata=iata, error=str(exc))
-        return None
-
-    @staticmethod
-    def _extract_entity_id(place: dict, match_iata: Optional[str] = None) -> Optional[str]:
-        sky_id = place.get("skyId") or place.get("iata") or place.get("id", "")
-        if match_iata and sky_id.upper() != match_iata.upper():
-            nav = place.get("navigation", {})
-            sky_from_nav = nav.get("relevantFlightParams", {}).get("skyId", "")
-            if sky_from_nav.upper() != match_iata.upper():
-                return None
-
-        for key_path in [
-            ("entityId",),
-            ("entity_id",),
-            ("navigation", "entityId"),
-            ("navigation", "relevantFlightParams", "entityId"),
-        ]:
-            obj = place
-            for k in key_path:
-                if isinstance(obj, dict):
-                    obj = obj.get(k)
-                else:
-                    obj = None
-                    break
-            if obj is not None:
-                return str(obj)
+            log.debug("skyscanner_resolve_failed", query=query, error=str(exc))
         return None
 
     # ── Endpoint probing ────────────────────────────────────────────────────
@@ -254,6 +319,16 @@ class SkyscannerScraper(BaseFlightScraper):
     ) -> List[RawFlightResult]:
         origin_entity = await self._resolve_entity_id(client, origin)
         dest_entity = await self._resolve_entity_id(client, destination)
+
+        if not origin_entity or not dest_entity:
+            log.debug(
+                "skyscanner_skip_pair",
+                origin=origin,
+                destination=destination,
+                origin_entity=origin_entity,
+                dest_entity=dest_entity,
+            )
+            return []
 
         url = f"https://{self._host}{self._search_endpoint}"
         params = self._build_search_params(
