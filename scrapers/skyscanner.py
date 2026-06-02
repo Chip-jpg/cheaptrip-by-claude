@@ -19,8 +19,8 @@ log = get_logger(__name__)
 
 _DEFAULT_ENDPOINT = "/api/v1/searchFlights"
 _CACHE_PATH = Path("data/skyscanner_cache.json")
-_PROBE_TTL_SECONDS = 3600  # re-probe endpoints every hour
-_ENTITY_TTL_SECONDS = 86400 * 7  # entity IDs are stable, cache for a week
+_PROBE_TTL_SECONDS = 3600
+_ENTITY_TTL_SECONDS = 86400 * 7
 
 _AIRPORT_SEARCH_PATHS = [
     "/flights/searchAirport",
@@ -37,6 +37,30 @@ _FLIGHT_SEARCH_PATHS = [
     "/search",
 ]
 
+# Confirmed entity IDs from API responses and Skyscanner documentation.
+# City-level IDs (2753/2754 range) work for all airports in that city.
+# Airport-level IDs (9556 range) are for specific airports.
+_KNOWN_ENTITIES: Dict[str, str] = {
+    # Cities (confirmed from Skyscanner docs / API)
+    "LOND": "27544008",   # London
+    "PARI": "27539733",   # Paris
+    "NYCA": "27537542",   # New York
+    # Airports (confirmed from API response)
+    "MXP": "95565070",    # Milan Malpensa
+}
+
+# IATA airport codes → Skyscanner city skyId codes.
+# The API prefers city-level skyIds (LOND) over airport codes (LHR).
+_IATA_TO_SKYID: Dict[str, str] = {
+    "LHR": "LOND", "LGW": "LOND", "STN": "LOND", "LTN": "LOND",
+    "CDG": "PARI", "ORY": "PARI",
+    "FCO": "ROME", "CIA": "ROME",
+    "JFK": "NYCA", "EWR": "NYCA",
+    "NRT": "TYOA", "HND": "TYOA",
+    "MXP": "MILA", "LIN": "MILA", "BGY": "MILA",
+}
+
+# IATA → city name for airport resolution fallback
 _IATA_TO_CITY: Dict[str, str] = {
     "LHR": "London", "LGW": "London", "STN": "London", "LTN": "London",
     "CDG": "Paris", "ORY": "Paris",
@@ -116,8 +140,8 @@ def _save_cache(data: dict) -> None:
 class SkyscannerScraper(BaseFlightScraper):
     """Skyscanner via RapidAPI with persistent cache.
 
-    Caches discovered endpoints (1-hour TTL) and entity IDs (7-day TTL)
-    to disk so restarts don't waste API calls on re-probing.
+    Caches discovered endpoints (1h TTL) and entity IDs (7-day TTL).
+    Falls back to hardcoded entity IDs when the API is rate-limited.
     """
 
     source_id = "skyscanner_api"
@@ -144,14 +168,12 @@ class SkyscannerScraper(BaseFlightScraper):
 
         now = time.time()
 
-        # Restore entity IDs (long TTL — airports don't change)
         entities = cache.get("entities", {})
         entities_ts = cache.get("entities_cached_at", 0)
         if entities and (now - entities_ts) < _ENTITY_TTL_SECONDS:
             self._entity_cache = entities
             log.info("skyscanner_cache_entities_loaded", count=len(entities))
 
-        # Restore endpoints (short TTL — re-probe hourly)
         probe_ts = cache.get("probe_cached_at", 0)
         if (now - probe_ts) < _PROBE_TTL_SECONDS:
             airport_ep = cache.get("airport_endpoint")
@@ -171,7 +193,6 @@ class SkyscannerScraper(BaseFlightScraper):
         now = time.time()
         existing = _load_cache()
 
-        # Merge entity caches — keep accumulated IDs from previous runs
         merged_entities = existing.get("entities", {})
         merged_entities.update(self._entity_cache)
 
@@ -189,6 +210,22 @@ class SkyscannerScraper(BaseFlightScraper):
             "X-RapidAPI-Key": self._key,
             "X-RapidAPI-Host": self._host,
         }
+
+    def _get_sky_id(self, iata: str) -> str:
+        return _IATA_TO_SKYID.get(iata, iata)
+
+    def _get_entity_id(self, iata: str) -> Optional[str]:
+        """Look up entity ID: cache → known hardcoded → skyId fallback."""
+        if iata in self._entity_cache:
+            return self._entity_cache[iata]
+        sky_id = self._get_sky_id(iata)
+        if sky_id in self._entity_cache:
+            return self._entity_cache[sky_id]
+        if iata in _KNOWN_ENTITIES:
+            return _KNOWN_ENTITIES[iata]
+        if sky_id in _KNOWN_ENTITIES:
+            return _KNOWN_ENTITIES[sky_id]
+        return None
 
     # ── Airport resolution ──────────────────────────────────────────────────
 
@@ -209,8 +246,9 @@ class SkyscannerScraper(BaseFlightScraper):
         return None
 
     async def _resolve_entity_id(self, client: httpx.AsyncClient, iata: str) -> Optional[str]:
-        if iata in self._entity_cache:
-            return self._entity_cache[iata]
+        cached = self._get_entity_id(iata)
+        if cached:
+            return cached
         if not self._airport_endpoint:
             return None
 
@@ -228,7 +266,6 @@ class SkyscannerScraper(BaseFlightScraper):
                 self._persist_cache()
                 return entity_id
 
-        log.debug("skyscanner_entity_not_found", iata=iata)
         return None
 
     async def _try_resolve(self, client: httpx.AsyncClient, query: str) -> Optional[str]:
@@ -276,6 +313,35 @@ class SkyscannerScraper(BaseFlightScraper):
             log.debug("skyscanner_resolve_failed", query=query, error=str(exc))
         return None
 
+    # ── Batch resolution (called from CLI) ──────────────────────────────────
+
+    async def resolve_all_airports(self, iata_codes: List[str]) -> Dict[str, str]:
+        """Resolve a list of IATA codes and cache entity IDs. For CLI use."""
+        resolved: Dict[str, str] = {}
+        async with build_client(timeout=30.0) as client:
+            if not self._airport_endpoint:
+                self._airport_endpoint = await self._find_airport_endpoint(client)
+                if not self._airport_endpoint:
+                    log.error("skyscanner_no_airport_endpoint")
+                    return resolved
+
+            for iata in iata_codes:
+                existing = self._get_entity_id(iata)
+                if existing:
+                    resolved[iata] = existing
+                    continue
+
+                entity_id = await self._resolve_entity_id(client, iata)
+                if entity_id:
+                    resolved[iata] = entity_id
+                    log.info("resolved", iata=iata, entity_id=entity_id)
+                else:
+                    log.warning("unresolved", iata=iata)
+                await asyncio.sleep(0.3)
+
+        self._persist_cache()
+        return resolved
+
     # ── Endpoint probing ────────────────────────────────────────────────────
 
     def _build_search_params(
@@ -289,8 +355,8 @@ class SkyscannerScraper(BaseFlightScraper):
         dest_entity: Optional[str] = None,
     ) -> dict:
         params: dict = {
-            "originSkyId": origin,
-            "destinationSkyId": destination,
+            "originSkyId": self._get_sky_id(origin),
+            "destinationSkyId": self._get_sky_id(destination),
             "date": dep_date.strftime("%Y-%m-%d"),
             "adults": str(adults),
             "currency": "EUR",
@@ -361,12 +427,14 @@ class SkyscannerScraper(BaseFlightScraper):
     async def _probe(self, client: httpx.AsyncClient) -> bool:
         self._airport_endpoint = await self._find_airport_endpoint(client)
 
-        origin_entity = None
-        dest_entity = None
+        origin_entity = self._get_entity_id("MXP")
+        dest_entity = self._get_entity_id("LHR")
         if self._airport_endpoint:
-            origin_entity = await self._resolve_entity_id(client, "MXP")
-            dest_entity = await self._resolve_entity_id(client, "LHR")
-            log.info("skyscanner_entities", mxp=origin_entity, lhr=dest_entity)
+            if not origin_entity:
+                origin_entity = await self._resolve_entity_id(client, "MXP")
+            if not dest_entity:
+                dest_entity = await self._resolve_entity_id(client, "LHR")
+        log.info("skyscanner_entities", mxp=origin_entity, lhr=dest_entity)
 
         self._search_endpoint = await self._probe_search_endpoint(
             client, origin_entity, dest_entity,
@@ -392,8 +460,13 @@ class SkyscannerScraper(BaseFlightScraper):
         return_date: Optional[date],
         adults: int,
     ) -> List[RawFlightResult]:
-        origin_entity = await self._resolve_entity_id(client, origin)
-        dest_entity = await self._resolve_entity_id(client, destination)
+        origin_entity = self._get_entity_id(origin)
+        dest_entity = self._get_entity_id(destination)
+
+        if not origin_entity:
+            origin_entity = await self._resolve_entity_id(client, origin)
+        if not dest_entity:
+            dest_entity = await self._resolve_entity_id(client, destination)
 
         if not origin_entity or not dest_entity:
             log.debug(

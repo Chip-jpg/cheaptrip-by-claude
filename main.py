@@ -121,6 +121,35 @@ Alerts sent:      {alerts_sent}
     asyncio.run(_run())
 
 
+@cli.command("resolve-airports")
+def resolve_airports() -> None:
+    """Resolve and cache Skyscanner entity IDs for all airports.
+
+    Run this once when your RapidAPI rate limit resets to populate the cache.
+    After that, the engine uses cached IDs and doesn't waste API calls.
+    """
+    from config import ALL_ORIGIN_AIRPORTS, POPULAR_DESTINATIONS
+    from scrapers.skyscanner import SkyscannerScraper
+
+    async def _run():
+        scraper = SkyscannerScraper()
+        if not scraper.enabled:
+            click.echo("Skyscanner scraper disabled (no RAPIDAPI_KEY). Set it in .env first.")
+            return
+        all_airports = list(set(ALL_ORIGIN_AIRPORTS + POPULAR_DESTINATIONS))
+        click.echo(f"Resolving {len(all_airports)} airports...")
+        resolved = await scraper.resolve_all_airports(all_airports)
+        click.echo(f"\nResolved {len(resolved)}/{len(all_airports)} airports:")
+        for iata, eid in sorted(resolved.items()):
+            click.echo(f"  {iata}: {eid}")
+        if len(resolved) < len(all_airports):
+            missing = set(all_airports) - set(resolved.keys())
+            click.echo(f"\nMissing ({len(missing)}): {', '.join(sorted(missing))}")
+            click.echo("Try again later when rate limit resets.")
+
+    asyncio.run(_run())
+
+
 @cli.command()
 def health() -> None:
     """Show scraper health status (requires at least one cycle to have run)."""
