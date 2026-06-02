@@ -61,7 +61,10 @@ class SecretFlyingScraper(BaseFlightScraper):
 
     source_id = "secret_flying"
 
-    @async_retry(max_attempts=3, min_wait=2.0, max_wait=15.0)
+    @async_retry(
+        max_attempts=3, min_wait=2.0, max_wait=15.0,
+        retry_on=(httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError),
+    )
     async def _fetch_page(self, client: httpx.AsyncClient, url: str) -> Optional[str]:
         resp = await client.get(url, headers=random_headers())
         resp.raise_for_status()

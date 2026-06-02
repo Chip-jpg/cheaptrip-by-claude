@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     # Skyscanner via RapidAPI
     rapidapi_key: str = Field(default="")
     rapidapi_skyscanner_host: str = Field(default="skyscanner50.p.rapidapi.com")
+    # Endpoint path — check the "Endpoints" tab in your RapidAPI console if you get 404s
+    rapidapi_skyscanner_endpoint: str = Field(default="/api/v1/searchFlights")
 
     # Currency
     exchange_rate_api_key: str = Field(default="")

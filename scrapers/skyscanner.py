@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from datetime import date, timedelta
 from typing import List, Optional
 
 import httpx
@@ -14,11 +14,14 @@ from utils.retry import async_retry
 
 log = get_logger(__name__)
 
-_RAPIDAPI_BASE = "https://skyscanner50.p.rapidapi.com/api/v1"
-
 
 class SkyscannerScraper(BaseFlightScraper):
-    """Skyscanner via RapidAPI skyscanner50."""
+    """Skyscanner via RapidAPI.
+
+    Endpoint is configurable via RAPIDAPI_SKYSCANNER_ENDPOINT in .env.
+    If you see 404s, open the "Endpoints" tab in your RapidAPI console and
+    set that value to the correct path (e.g. /api/v2/flights/search).
+    """
 
     source_id = "skyscanner_api"
 
@@ -26,7 +29,10 @@ class SkyscannerScraper(BaseFlightScraper):
         settings = get_settings()
         self._key = settings.rapidapi_key
         self._host = settings.rapidapi_skyscanner_host
+        self._endpoint = settings.rapidapi_skyscanner_endpoint
+        self._base_url = f"https://{self._host}{self._endpoint}"
         self.enabled = bool(self._key)
+        self._logged_sample = False  # log one raw response per session to aid debugging
 
     def _headers(self) -> dict:
         return {
@@ -54,28 +60,54 @@ class SkyscannerScraper(BaseFlightScraper):
         if return_date:
             params["returnDate"] = return_date.strftime("%Y-%m-%d")
 
-        resp = await client.get(
-            f"{_RAPIDAPI_BASE}/searchFlights",
-            params=params,
-            headers=self._headers(),
-        )
+        resp = await client.get(self._base_url, params=params, headers=self._headers())
         resp.raise_for_status()
         data = resp.json()
 
+        # Log one raw sample per session so endpoint/format issues are visible
+        if not self._logged_sample:
+            self._logged_sample = True
+            top_keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+            log.info(
+                "skyscanner_response_sample",
+                url=self._base_url,
+                top_level_keys=top_keys,
+                preview=str(data)[:300],
+            )
+
         results: List[RawFlightResult] = []
-        itineraries = data.get("data", {}).get("itineraries", [])
+
+        # Try the most common response shapes
+        itineraries = (
+            data.get("data", {}).get("itineraries")          # shape A: {data:{itineraries:[]}}
+            or data.get("itineraries")                        # shape B: {itineraries:[]}
+            or data.get("data", {}).get("flights")            # shape C: {data:{flights:[]}}
+            or data.get("flights")                            # shape D: {flights:[]}
+            or data.get("results")                            # shape E: {results:[]}
+            or []
+        )
+
         for item in itineraries:
             try:
-                price_raw = item.get("price", {}).get("raw", 0)
-                if price_raw <= 0:
+                # Shape A/B (Skyscanner-style)
+                price_raw = (
+                    item.get("price", {}).get("raw")
+                    or item.get("price", {}).get("amount")
+                    or item.get("minPrice")
+                    or item.get("total")
+                    or 0
+                )
+                if not price_raw or float(price_raw) <= 0:
                     continue
-                legs = item.get("legs", [])
-                if not legs:
-                    continue
+
+                legs = item.get("legs") or item.get("segments") or []
                 airline = None
-                carriers = legs[0].get("carriers", {}).get("marketing", [])
-                if carriers:
-                    airline = carriers[0].get("name")
+                if legs:
+                    carriers = legs[0].get("carriers", {}).get("marketing", [])
+                    if carriers:
+                        airline = carriers[0].get("name")
+                    elif legs[0].get("airline"):
+                        airline = legs[0]["airline"]
 
                 results.append(
                     RawFlightResult(
@@ -86,7 +118,7 @@ class SkyscannerScraper(BaseFlightScraper):
                         departure_date=dep_date,
                         return_date=return_date,
                         airline=airline,
-                        booking_url=item.get("deeplink"),
+                        booking_url=item.get("deeplink") or item.get("url") or item.get("bookingUrl"),
                         source=self.source_id,
                         extra={"raw": item},
                     )
@@ -99,17 +131,12 @@ class SkyscannerScraper(BaseFlightScraper):
         results: List[RawFlightResult] = []
         tasks = []
         async with build_client(timeout=30.0) as client:
-            for origin in params.origins[:3]:  # rate-limit pairs per call
+            for origin in params.origins[:3]:
                 for dest in params.destinations[:10]:
                     dep = params.departure_date_from
-                    ret_date = None
-                    if params.nights_min:
-                        from datetime import timedelta
-                        ret_date = dep + timedelta(days=params.nights_min + 1)
+                    ret_date = dep + timedelta(days=params.nights_min + 1) if params.nights_min else None
                     tasks.append(
-                        self._search_one_pair(
-                            client, origin, dest, dep, ret_date, params.adults
-                        )
+                        self._search_one_pair(client, origin, dest, dep, ret_date, params.adults)
                     )
             gathered = await asyncio.gather(*tasks, return_exceptions=True)
             for r in gathered:

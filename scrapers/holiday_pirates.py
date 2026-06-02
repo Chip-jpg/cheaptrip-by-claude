@@ -16,9 +16,19 @@ from utils.retry import async_retry
 log = get_logger(__name__)
 
 _BASE = "https://www.holidaypirates.com"
-_DEALS_URL = f"{_BASE}/en/deals"
-_FEED_URL = f"{_BASE}/en/deals?category=flight"
-_HOTEL_FEED = f"{_BASE}/en/deals?category=hotel"
+# Try root paths first; /en/ locale prefix often redirects or 404s
+_FLIGHT_CANDIDATES = [
+    f"{_BASE}/deals?category=flight",
+    f"{_BASE}/flights",
+    f"{_BASE}/en/deals?category=flight",
+    f"{_BASE}/deals",
+]
+_HOTEL_CANDIDATES = [
+    f"{_BASE}/deals?category=hotel",
+    f"{_BASE}/hotels",
+    f"{_BASE}/en/deals?category=hotel",
+    f"{_BASE}/deals",
+]
 
 _AIRPORT_RE = re.compile(r"\b([A-Z]{3})\b")
 _PRICE_RE = re.compile(r"(?:from\s+)?[€\$£]?\s*(\d{1,4}(?:[.,]\d{2})?)\s*(?:€|EUR|USD|GBP)?", re.I)
@@ -46,7 +56,10 @@ class HolidayPiratesFlightScraper(BaseFlightScraper):
 
     source_id = "holiday_pirates"
 
-    @async_retry(max_attempts=3, min_wait=2.0, max_wait=15.0)
+    @async_retry(
+        max_attempts=3, min_wait=2.0, max_wait=15.0,
+        retry_on=(httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError),
+    )
     async def _fetch(self, client: httpx.AsyncClient, url: str) -> Optional[str]:
         resp = await client.get(url, headers=random_headers())
         resp.raise_for_status()
@@ -90,21 +103,21 @@ class HolidayPiratesFlightScraper(BaseFlightScraper):
     async def scrape(self, params: ScraperParams) -> List[RawFlightResult]:
         results: List[RawFlightResult] = []
         async with build_client(timeout=20.0) as client:
-            for url in [_DEALS_URL, _FEED_URL]:
+            for url in _FLIGHT_CANDIDATES:
                 try:
                     html = await self._fetch(client, url)
                     if not html:
                         continue
                     soup = BeautifulSoup(html, "lxml")
-                    cards = soup.find_all(
-                        "article"
-                    ) or soup.find_all(
+                    cards = soup.find_all("article") or soup.find_all(
                         "div", class_=re.compile(r"deal|card|offer|item", re.I)
                     )
                     for card in cards:
                         r = self._parse_flight_card(card, params.departure_date_from)
                         if r:
                             results.append(r)
+                    if results:
+                        break  # found results, no need to try more URLs
                 except Exception as exc:
                     log.warning("hp_flight_failed", url=url, error=str(exc))
         return results
@@ -115,7 +128,10 @@ class HolidayPiratesHotelScraper(BaseHotelScraper):
 
     source_id = "holiday_pirates"
 
-    @async_retry(max_attempts=3, min_wait=2.0, max_wait=15.0)
+    @async_retry(
+        max_attempts=3, min_wait=2.0, max_wait=15.0,
+        retry_on=(httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError),
+    )
     async def _fetch(self, client: httpx.AsyncClient, url: str) -> Optional[str]:
         resp = await client.get(url, headers=random_headers())
         resp.raise_for_status()
@@ -161,9 +177,11 @@ class HolidayPiratesHotelScraper(BaseHotelScraper):
     async def scrape(self, params: ScraperParams) -> List[RawHotelResult]:
         results: List[RawHotelResult] = []
         async with build_client(timeout=20.0) as client:
-            try:
-                html = await self._fetch(client, _HOTEL_FEED)
-                if html:
+            for url in _HOTEL_CANDIDATES:
+                try:
+                    html = await self._fetch(client, url)
+                    if not html:
+                        continue
                     soup = BeautifulSoup(html, "lxml")
                     cards = soup.find_all("article") or soup.find_all(
                         "div", class_=re.compile(r"deal|card|offer|hotel", re.I)
@@ -172,6 +190,8 @@ class HolidayPiratesHotelScraper(BaseHotelScraper):
                         r = self._parse_hotel_card(card, params)
                         if r:
                             results.append(r)
-            except Exception as exc:
-                log.warning("hp_hotel_failed", error=str(exc))
+                    if results:
+                        break
+                except Exception as exc:
+                    log.warning("hp_hotel_failed", url=url, error=str(exc))
         return results
