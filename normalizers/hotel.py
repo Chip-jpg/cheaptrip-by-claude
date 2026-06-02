@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List
 
 from normalizers.currency import get_converter
+from preferences import get_preferences
 from storage.models import HotelDeal, RawHotelResult
 from utils.confidence import compute_hotel_confidence
 from utils.logging_config import get_logger
@@ -33,6 +34,18 @@ async def normalize_hotels(raw: List[RawHotelResult]) -> List[HotelDeal]:
             continue
 
         try:
+            prefs = get_preferences()
+            rating = best.rating or 0.0
+            min_rating = prefs.minimum_hotel_rating
+            total_cost = price_per_night_eur * best.nights
+
+            # Hotel quality gate: pass if no rating data, meets minimum, or cost exception
+            meets_quality = (
+                rating == 0.0                              # no data → don't reject
+                or rating >= min_rating
+                or total_cost <= prefs.hotel_exceptionally_low_trip_cost
+            )
+
             deal = HotelDeal(
                 name=best.name,
                 location=best.location,
@@ -41,6 +54,7 @@ async def normalize_hotels(raw: List[RawHotelResult]) -> List[HotelDeal]:
                 total_price_eur=round(price_per_night_eur * best.nights, 2),
                 rating=best.rating,
                 stars=best.stars,
+                review_count=best.review_count if hasattr(best, "review_count") else None,
                 booking_url=best.booking_url,
                 source=best.source,
                 data_confidence_score=confidence,
@@ -49,6 +63,7 @@ async def normalize_hotels(raw: List[RawHotelResult]) -> List[HotelDeal]:
                 raw_price_per_night=best.price_per_night,
                 check_in=best.check_in,
                 check_out=best.check_out,
+                meets_quality_threshold=meets_quality,
             )
             deals.append(deal)
         except Exception as exc:

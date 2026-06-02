@@ -117,12 +117,17 @@ class TelegramNotifier:
     async def process_instant_queue(self, trips: List[Trip]) -> int:
         """
         Send as many instant alerts as rate limit allows.
-        Prioritizes by: confidence desc, total_cost asc.
+        Prioritizes by: booking_confidence (HIGH first), data_confidence desc, total_cost asc.
         Returns count of alerts sent.
         """
+        _bc_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
         sorted_trips = sorted(
             trips,
-            key=lambda t: (-t.data_confidence_score, t.total_cost_eur),
+            key=lambda t: (
+                _bc_order.get(t.booking_confidence.value, 2),
+                -t.data_confidence_score,
+                t.total_cost_eur,
+            ),
         )
 
         sent = 0

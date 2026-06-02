@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timedelta
-from typing import Optional
+from datetime import datetime
+from typing import List
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -15,10 +15,14 @@ from filters.time_decay import apply_time_decay
 from normalizers.flight import normalize_flights
 from normalizers.hotel import normalize_hotels
 from notifier.telegram import TelegramNotifier
+from preferences import get_preferences
 from scrapers.aggregator import ScraperAggregator
+from scrapers.health_monitor import get_health_monitor
 from storage.database import get_digest_deals, get_pending_instant_alerts, init_db
 from storage.models import ScraperParams
 from trip_builder.builder import build_trips
+from trip_builder.date_discovery import generate_search_windows
+from utils.airport_clusters import expand_list_to_clusters
 from utils.logging_config import get_logger
 
 log = get_logger(__name__)
@@ -27,82 +31,72 @@ _notifier = TelegramNotifier()
 _aggregator = ScraperAggregator()
 
 
-def _build_scraper_params(
-    origins: list[str],
-    destinations: list[str],
-    departure_from: Optional[date] = None,
-    nights_min: int = 2,
-    nights_max: int = 7,
-) -> ScraperParams:
-    if departure_from is None:
-        departure_from = datetime.utcnow().date() + timedelta(days=7)
-    departure_to = departure_from + timedelta(days=30)
-    return ScraperParams(
-        origins=origins,
-        destinations=destinations,
-        departure_date_from=departure_from,
-        departure_date_to=departure_to,
-        nights_min=nights_min,
-        nights_max=nights_max,
-    )
-
-
 async def run_pipeline_cycle() -> None:
     """
     Full pipeline execution:
-    1. Scrape flights + hotels
-    2. Normalize to EUR + confidence scores
-    3. Build trips (direct, complete, repositioned)
-    4. Apply hard filters
-    5. Apply time decay
-    6. Deduplicate
-    7. Send instant alerts (up to quota)
+    1. Load user preferences + generate flexible date windows
+    2. Scrape flights + hotels (cluster-expanded airports)
+    3. Normalize to EUR + confidence scores
+    4. Build trips (direct, complete, repositioned)
+    5. Apply hard filters (quality gate + feasibility gate)
+    6. Apply time decay
+    7. Deduplicate
+    8. Send instant alerts (up to quota)
     """
     cycle_start = datetime.utcnow()
     log.info("pipeline_cycle_start", ts=cycle_start.isoformat())
 
     try:
-        # ── Layer 1 primary origins ───────────────────────────────────────────
-        params_primary = _build_scraper_params(
-            origins=LAYER_1_AIRPORTS,
-            destinations=POPULAR_DESTINATIONS[:30],
+        prefs = get_preferences()
+
+        # Cluster-expand home airports from preferences
+        origins = expand_list_to_clusters(prefs.home_airports)
+        destinations = POPULAR_DESTINATIONS
+
+        # Generate flexible date windows based on preferred trip lengths
+        param_batches = generate_search_windows(
+            prefs=prefs,
+            origins=origins,
+            destinations=destinations,
+            max_price_eur=prefs.max_trip_budget or 2000.0,
         )
 
-        # ── Layer 2+3: Italy + EU hubs for repositioning ──────────────────────
-        params_expanded = _build_scraper_params(
-            origins=LAYER_2_AIRPORTS + LAYER_3_HUBS[:5],
-            destinations=POPULAR_DESTINATIONS[30:60],
+        log.info(
+            "search_windows_generated",
+            batches=len(param_batches),
+            origins=len(origins),
+            destinations=len(destinations),
         )
 
-        # Collect from all scrapers concurrently
-        (raw_flights_p, flight_stats_p), (raw_hotels_p, hotel_stats_p) = await asyncio.gather(
-            _aggregator.collect_flights(params_primary),
-            _aggregator.collect_hotels(params_primary),
-        )
-        (raw_flights_e, _), _ = await asyncio.gather(
-            _aggregator.collect_flights(params_expanded),
-            asyncio.sleep(0),
-        )
+        # Collect from all scrapers across all date windows
+        all_raw_flights = []
+        all_raw_hotels = []
 
-        raw_flights = raw_flights_p + raw_flights_e
-        raw_hotels = raw_hotels_p
+        for params in param_batches:
+            (raw_flights, _), (raw_hotels, _) = await asyncio.gather(
+                _aggregator.collect_flights(params),
+                _aggregator.collect_hotels(params),
+            )
+            all_raw_flights.extend(raw_flights)
+            all_raw_hotels.extend(raw_hotels)
 
         log.info(
             "raw_collected",
-            flights=len(raw_flights),
-            hotels=len(raw_hotels),
+            flights=len(all_raw_flights),
+            hotels=len(all_raw_hotels),
         )
 
         # ── Normalize ─────────────────────────────────────────────────────────
         flight_legs, hotel_deals = await asyncio.gather(
-            normalize_flights(raw_flights),
-            normalize_hotels(raw_hotels),
+            normalize_flights(all_raw_flights),
+            normalize_hotels(all_raw_hotels),
         )
 
         # ── Build trips ───────────────────────────────────────────────────────
         trips = await build_trips(flight_legs, hotel_deals)
         if not trips:
             log.info("no_trips_built_this_cycle")
+            await _log_health_summary()
             return
 
         # ── Hard filters ──────────────────────────────────────────────────────
@@ -110,7 +104,6 @@ async def run_pipeline_cycle() -> None:
 
         # ── Time decay ────────────────────────────────────────────────────────
         instant_fresh, digest_fresh, _ = apply_time_decay(instant_candidates)
-        # Digest candidates stay as digest regardless of decay
         all_digest = digest_fresh + digest_candidates
 
         # ── Deduplication ─────────────────────────────────────────────────────
@@ -128,12 +121,29 @@ async def run_pipeline_cycle() -> None:
             sent = await _notifier.process_instant_queue(new_instant)
             log.info("instant_alerts_sent", count=sent)
 
+        await _log_health_summary()
+
         duration = (datetime.utcnow() - cycle_start).total_seconds()
         log.info("pipeline_cycle_complete", duration_s=round(duration, 1))
 
     except Exception as exc:
         log.error("pipeline_cycle_failed", error=str(exc), exc_info=True)
         # Do NOT crash the scheduler — just log
+
+
+async def _log_health_summary() -> None:
+    """Log a brief scraper health summary after each cycle."""
+    try:
+        monitor = get_health_monitor()
+        report = await monitor.get_health_report()
+        failing = [h.source_id for h in report if h.status in ("FAILING", "STALE")]
+        if failing:
+            log.warning("scrapers_degraded", sources=failing)
+        else:
+            ok = sum(1 for h in report if h.status == "OK")
+            log.info("scraper_health_ok", ok_count=ok, total=len(report))
+    except Exception:
+        pass
 
 
 async def run_daily_digest() -> None:
@@ -189,24 +199,27 @@ async def run_forever() -> None:
     await init_db()
     log.info("database_initialized")
 
+    prefs = get_preferences()
     scheduler = create_scheduler()
     scheduler.start()
     log.info(
         "scheduler_started",
         interval_min=get_settings().scrape_interval_minutes,
+        home_airports=prefs.home_airports,
+        trip_lengths=prefs.preferred_trip_lengths,
+        search_window_days=prefs.search_window_days,
     )
 
-    # Notify Telegram that engine is running
     await _notifier.send_system_message(
         "🚀 Travel Deal Intelligence Engine started\n"
-        f"Monitoring {len(LAYER_1_AIRPORTS + LAYER_2_AIRPORTS + LAYER_3_HUBS)} airports "
-        f"× {len(POPULAR_DESTINATIONS)} destinations"
+        f"Origins: {', '.join(prefs.home_airports)}\n"
+        f"Profiles: {', '.join(prefs.preferred_trip_lengths)}\n"
+        f"Monitoring {len(POPULAR_DESTINATIONS)} destinations"
     )
 
-    # Run immediately on startup (don't wait for first interval)
+    # Run immediately on startup
     await run_pipeline_cycle()
 
-    # Keep running
     try:
         while True:
             await asyncio.sleep(60)

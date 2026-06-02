@@ -48,12 +48,27 @@ CREATE TABLE IF NOT EXISTS price_history (
 )
 """
 
+_CREATE_PRICE_STATS_TABLE = """
+CREATE TABLE IF NOT EXISTS price_stats (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    route        TEXT NOT NULL,
+    all_time_low REAL,
+    avg_30d      REAL,
+    avg_90d      REAL,
+    std_dev_30d  REAL,
+    sample_count INTEGER DEFAULT 0,
+    last_updated TEXT NOT NULL,
+    UNIQUE(route)
+)
+"""
+
 _CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_deals_hash ON deals(hash)",
     "CREATE INDEX IF NOT EXISTS idx_deals_created ON deals(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_deals_alerted ON deals(is_alerted)",
     "CREATE INDEX IF NOT EXISTS idx_alerts_sent_at ON alerts_sent(sent_at)",
     "CREATE INDEX IF NOT EXISTS idx_prices_route ON price_history(route)",
+    "CREATE INDEX IF NOT EXISTS idx_price_stats_route ON price_stats(route)",
 ]
 
 
@@ -77,6 +92,7 @@ async def init_db() -> None:
         await db.execute(_CREATE_DEALS_TABLE)
         await db.execute(_CREATE_ALERTS_TABLE)
         await db.execute(_CREATE_PRICES_TABLE)
+        await db.execute(_CREATE_PRICE_STATS_TABLE)
         for idx_sql in _CREATE_INDEXES:
             await db.execute(idx_sql)
         await db.commit()

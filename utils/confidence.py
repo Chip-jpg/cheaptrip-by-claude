@@ -119,3 +119,31 @@ def compute_trip_confidence(component_scores: List[float]) -> float:
     if not component_scores:
         return 0.0
     return round(sum(component_scores) / len(component_scores), 3)
+
+
+def compute_booking_confidence(
+    data_confidence_score: float,
+    source_count: int,
+    has_booking_url: bool,
+    is_error_fare: bool = False,
+) -> "BookingConfidence":
+    """
+    Assign a human-readable booking confidence tier.
+
+    HIGH  = multiple verified sources, direct booking URL available
+    MEDIUM = partially verified or single source with URL
+    LOW   = unverified, no URL, or error fare with uncertainty
+    """
+    from storage.models import BookingConfidence
+
+    # Error fares carry uncertainty even with good data
+    if is_error_fare:
+        return BookingConfidence.MEDIUM if has_booking_url else BookingConfidence.LOW
+
+    if data_confidence_score >= 0.75 and source_count >= 2 and has_booking_url:
+        return BookingConfidence.HIGH
+    if data_confidence_score >= 0.50 and has_booking_url:
+        return BookingConfidence.MEDIUM
+    if data_confidence_score >= 0.65 and source_count >= 2:
+        return BookingConfidence.MEDIUM
+    return BookingConfidence.LOW

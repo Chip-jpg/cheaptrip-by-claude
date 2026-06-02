@@ -2,10 +2,28 @@ from __future__ import annotations
 
 from typing import List, Optional
 
-from storage.models import DealType, Trip
+from storage.models import BookingConfidence, DealType, Trip
 from utils.logging_config import get_logger
 
 log = get_logger(__name__)
+
+_BC_EMOJI = {
+    BookingConfidence.HIGH: "🟢",
+    BookingConfidence.MEDIUM: "🟡",
+    BookingConfidence.LOW: "🔴",
+}
+
+
+def _confidence_line(trip: Trip) -> str:
+    emoji = _BC_EMOJI.get(trip.booking_confidence, "⚪")
+    label = f"{emoji} {trip.booking_confidence.value}"
+    return f"*Booking confidence:* {label}  _(data: {trip.data_confidence_score:.2f})_"
+
+
+def _category_line(trip: Trip) -> str:
+    if trip.category:
+        return f"*Category:* {trip.category.value}"
+    return ""
 
 # ── Deterministic formatters (no AI needed for standard templates) ────────────
 
@@ -54,10 +72,21 @@ def format_complete_trip(trip: Trip) -> str:
         trip.verdict, "⚪"
     )
     lines.append(f"*Verdict:*\n{verdict_emoji} {trip.verdict}")
-    lines.append(f"*Confidence:* {trip.data_confidence_score:.2f}")
+    cat = _category_line(trip)
+    if cat:
+        lines.append(cat)
+    lines.append(_confidence_line(trip))
 
     if trip.is_error_fare:
         lines.append("\n⚠️ _Possible error fare — book fast, verify after_")
+
+    if not trip.is_feasible and trip.feasibility_notes:
+        lines.append(f"\n⚠️ _Feasibility: {'; '.join(trip.feasibility_notes)}_")
+
+    if trip.is_historical_low:
+        lines.append("\n🏆 _Historical price low!_")
+    elif trip.historical_deviation_pct and trip.historical_deviation_pct < -15:
+        lines.append(f"\n📉 _{abs(trip.historical_deviation_pct):.0f}% below 30-day average_")
 
     if trip.outbound_flight and trip.outbound_flight.booking_url:
         lines.append(f"\n[🔗 Book Now]({trip.outbound_flight.booking_url})")
@@ -85,10 +114,16 @@ def format_flight_only(trip: Trip) -> str:
 
     verdict_emoji = {"BOOK NOW": "🟢", "VERIFY & BOOK": "🟡"}.get(trip.verdict, "⚪")
     lines.append(f"\n*Verdict:* {verdict_emoji} {trip.verdict}")
-    lines.append(f"*Confidence:* {trip.data_confidence_score:.2f}")
+    cat = _category_line(trip)
+    if cat:
+        lines.append(cat)
+    lines.append(_confidence_line(trip))
 
     if trip.is_error_fare:
         lines.append("\n⚠️ _Possible error fare_")
+
+    if trip.is_historical_low:
+        lines.append("🏆 _Historical price low!_")
 
     if trip.outbound_flight and trip.outbound_flight.booking_url:
         lines.append(f"\n[🔗 Book Now]({trip.outbound_flight.booking_url})")
@@ -110,7 +145,10 @@ def format_hotel_only(trip: Trip) -> str:
         if trip.hotel.booking_url:
             lines.append(f"\n[🔗 Book Now]({trip.hotel.booking_url})")
 
-    lines.append(f"\n*Confidence:* {trip.data_confidence_score:.2f}")
+    cat = _category_line(trip)
+    if cat:
+        lines.append(f"\n{cat}")
+    lines.append(_confidence_line(trip))
     return "\n".join(lines)
 
 
@@ -137,7 +175,10 @@ def format_repositioned(trip: Trip) -> str:
 
     verdict_emoji = {"BOOK NOW": "🟢", "VERIFY & BOOK": "🟡"}.get(trip.verdict, "⚪")
     lines.append(f"\n*Verdict:* {verdict_emoji} {trip.verdict}")
-    lines.append(f"*Confidence:* {trip.data_confidence_score:.2f}")
+    cat = _category_line(trip)
+    if cat:
+        lines.append(cat)
+    lines.append(_confidence_line(trip))
     lines.append("\n_Book each leg separately as independent tickets_")
 
     return "\n".join(lines)
@@ -150,15 +191,14 @@ def format_digest(trips: List[Trip]) -> str:
     lines.append("─" * 20)
 
     for i, trip in enumerate(trips[:15], 1):  # max 15 in digest
-        dest = ""
-        if trip.outbound_flight:
-            dest = trip.outbound_flight.destination
         discount_str = f" (-{trip.discount_pct:.0f}%)" if trip.discount_pct else ""
+        deal_icon = "✈️" if trip.deal_type in (DealType.FLIGHT_ONLY, DealType.REPOSITIONED) else "🏨+✈️"
+        bc_emoji = _BC_EMOJI.get(trip.booking_confidence, "⚪")
+        cat_str = f" | {trip.category.value}" if trip.category else ""
         lines.append(
             f"{i}. {trip.route}\n"
-            f"   💰 €{trip.total_cost_eur:.0f}{discount_str} | "
-            f"{'✈️' if trip.deal_type in (DealType.FLIGHT_ONLY, DealType.REPOSITIONED) else '🏨+✈️'} | "
-            f"conf: {trip.data_confidence_score:.2f}"
+            f"   💰 €{trip.total_cost_eur:.0f}{discount_str} | {deal_icon}{cat_str} | "
+            f"{bc_emoji} {trip.booking_confidence.value}"
         )
 
     lines.append("\n_Reply /deals for full details_")

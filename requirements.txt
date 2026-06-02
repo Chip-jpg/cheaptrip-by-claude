@@ -36,3 +36,4 @@ click==8.1.7
 pytest==8.2.0
 pytest-asyncio==0.23.7
 pytest-httpx==0.30.0
+PyYAML>=6.0

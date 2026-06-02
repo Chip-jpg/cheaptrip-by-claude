@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
@@ -42,6 +43,22 @@ class Settings(BaseSettings):
     flight_discount_min_pct: float = Field(default=60.0)
     instant_alerts_per_hour: int = Field(default=5)
 
+    # Hotel quality
+    minimum_hotel_rating: float = Field(default=7.0)
+    preferred_hotel_rating: float = Field(default=8.0)
+    hotel_low_rating_max_discount: float = Field(default=70.0)
+
+    # Booking confidence
+    booking_confidence_min_for_instant: str = Field(default="MEDIUM")
+
+    # Historical price analytics
+    price_anomaly_std_dev_threshold: float = Field(default=2.0)
+    price_sudden_drop_pct: float = Field(default=30.0)
+
+    # Flexible date search
+    preferred_trip_lengths: List[str] = Field(default=["weekend", "short", "medium"])
+    search_window_days: int = Field(default=90)
+
     # Logging
     log_level: str = Field(default="INFO")
     log_file: str = Field(default="./logs/engine.log")
@@ -61,6 +78,50 @@ LAYER_2_AIRPORTS = ["VCE", "VRN", "BLQ", "FCO", "CIA"]
 LAYER_3_HUBS = ["LHR", "LGW", "AMS", "CDG", "FRA", "MAD", "BCN", "DUB"]
 
 ALL_ORIGIN_AIRPORTS = LAYER_1_AIRPORTS + LAYER_2_AIRPORTS + LAYER_3_HUBS
+
+# ── Airport clusters (nearby airports for the same city/region) ───────────────
+
+AIRPORT_CLUSTERS: dict[str, list[str]] = {
+    "Milan":        ["MXP", "LIN", "BGY"],
+    "London":       ["LHR", "LGW", "STN", "LTN"],
+    "Paris":        ["CDG", "ORY"],
+    "Rome":         ["FCO", "CIA"],
+    "Barcelona":    ["BCN", "GRO"],
+    "New York":     ["JFK", "EWR"],
+    "Tokyo":        ["NRT", "HND"],
+    "Stockholm":    ["ARN", "BMA"],
+    "Oslo":         ["OSL", "TRF"],
+    "Copenhagen":   ["CPH", "AAR"],
+}
+
+# Reverse map: airport code → cluster name
+CLUSTER_REVERSE: dict[str, str] = {
+    airport: cluster
+    for cluster, airports in AIRPORT_CLUSTERS.items()
+    for airport in airports
+}
+
+# ── Trip length profiles ──────────────────────────────────────────────────────
+
+TRIP_LENGTH_NIGHTS: dict[str, tuple[int, int]] = {
+    "weekend": (2, 4),
+    "short":   (4, 7),
+    "medium":  (7, 14),
+    "long":    (14, 30),
+}
+
+# ── Feasibility constraints ───────────────────────────────────────────────────
+
+FEASIBILITY_MAX_TRAVEL_HOURS: dict[str, float] = {
+    "weekend": 8.0,
+    "short":   12.0,
+    "medium":  16.0,
+    "long":    24.0,
+}
+
+FEASIBILITY_MIN_NIGHTS: dict[str, int] = {
+    "long": 5,
+}
 
 # Primary search destinations — popular short/long haul from Italy
 POPULAR_DESTINATIONS = [

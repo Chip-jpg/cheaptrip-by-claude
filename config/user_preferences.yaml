@@ -1,0 +1,51 @@
+# ============================================================
+# Travel Deal Intelligence Engine — User Preferences
+# ============================================================
+# Edit this file to customize the engine's behavior.
+# Changes take effect on next startup (no code edits needed).
+
+# Airports you depart from. The engine expands each to its full cluster
+# (e.g. MXP also searches LIN and BGY automatically).
+home_airports:
+  - MXP
+  - LIN
+  - BGY
+
+# Allow multi-leg repositioning routes (e.g. BGY → LHR → NYC).
+allow_repositioning: true
+
+# Maximum total trip budget in EUR. null = no limit.
+max_trip_budget: null
+
+# Destination airport codes to never alert for.
+excluded_destinations: []
+
+# Trip duration profiles to search for.
+# Options: weekend (2-4 nights), short (4-7), medium (7-14), long (14-30)
+preferred_trip_lengths:
+  - weekend
+  - short
+  - medium
+
+# Hotel minimum rating (out of 10). Hotels below this are filtered unless
+# the discount exceeds hotel_low_rating_discount_threshold or total trip
+# cost is below hotel_exceptionally_low_trip_cost.
+minimum_hotel_rating: 7.0
+
+# Preferred hotel rating — used for Luxury Discount categorization.
+preferred_hotel_rating: 8.0
+
+# A hotel below minimum_hotel_rating is still considered if its
+# discount (vs normal price) exceeds this percentage.
+hotel_low_rating_discount_threshold: 70.0
+
+# A hotel below minimum_hotel_rating is still considered if the total
+# trip cost is this cheap (EUR). Extremely cheap trips override quality gate.
+hotel_exceptionally_low_trip_cost: 80.0
+
+# How many days ahead to search for deals.
+# Larger values find more deals but take longer to scrape.
+search_window_days: 90
+
+# Minimum number of reviews a hotel must have (null = no minimum).
+min_hotel_review_count: null

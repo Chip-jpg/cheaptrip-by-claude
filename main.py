@@ -79,20 +79,36 @@ def status() -> None:
                 prices = (await cur.fetchone())[0]
                 cur = await db.execute("SELECT COUNT(*) FROM alerts_sent")
                 alerts_sent = (await cur.fetchone())[0]
+                cur = await db.execute("SELECT COUNT(*) FROM price_stats")
+                price_stats = (await cur.fetchone())[0]
 
             click.echo(f"""
 Travel Deal Intelligence Engine — Status
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Database:       {path}
-Total deals:    {total}
-Alerted:        {alerted}
-Instant-tier:   {instant}
-Price records:  {prices}
-Alerts sent:    {alerts_sent}
+Database:         {path}
+Total deals:      {total}
+Alerted:          {alerted}
+Instant-tier:     {instant}
+Price records:    {prices}
+Price stat routes:{price_stats}
+Alerts sent:      {alerts_sent}
 """)
         except Exception as exc:
             click.echo(f"DB not found or not initialized: {exc}")
             click.echo("Run 'python main.py cycle' to initialize.")
+
+    asyncio.run(_run())
+
+
+@cli.command()
+def health() -> None:
+    """Show scraper health status (requires at least one cycle to have run)."""
+    from scrapers.health_monitor import get_health_monitor
+
+    async def _run():
+        monitor = get_health_monitor()
+        summary = await monitor.get_summary()
+        click.echo(summary)
 
     asyncio.run(_run())
 

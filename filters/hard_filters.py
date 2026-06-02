@@ -43,9 +43,34 @@ def apply_hard_filters(trips: List[Trip]) -> Tuple[List[Trip], List[Trip]]:
             discarded += 1
             continue
 
+        # Hotel quality gate: skip low-quality hotels unless big discount
+        if (
+            trip.hotel
+            and not trip.hotel.meets_quality_threshold
+            and (not trip.discount_pct or trip.discount_pct < 70.0)
+        ):
+            discarded += 1
+            continue
+
         is_europe = _is_europe_trip(trip)
         cost = trip.total_cost_eur
         discount = trip.discount_pct or 0.0
+
+        # Digest condition (reused below for infeasible trips)
+        passes_digest = (
+            (is_europe and cost < settings.europe_trip_max_eur * 2.5)
+            or (not is_europe and cost < settings.longhaul_trip_max_eur * 1.5)
+            or (discount >= 35.0)
+        )
+
+        # Infeasible trips are capped at DIGEST
+        if not trip.is_feasible:
+            if passes_digest:
+                trip.alert_tier = AlertTier.DIGEST
+                digest.append(trip)
+            else:
+                discarded += 1
+            continue
 
         # Hard instant conditions
         passes_instant = (
@@ -60,13 +85,6 @@ def apply_hard_filters(trips: List[Trip]) -> Tuple[List[Trip], List[Trip]]:
             trip.alert_tier = AlertTier.INSTANT
             instant.append(trip)
             continue
-
-        # Digest condition: reasonable deal worth including in daily summary
-        passes_digest = (
-            (is_europe and cost < settings.europe_trip_max_eur * 2.5)
-            or (not is_europe and cost < settings.longhaul_trip_max_eur * 1.5)
-            or (discount >= 35.0)
-        )
 
         if passes_digest:
             trip.alert_tier = AlertTier.DIGEST

@@ -22,6 +22,31 @@ class AlertTier(str, Enum):
     ARCHIVE = "archive"
 
 
+class TripLengthProfile(str, Enum):
+    WEEKEND = "weekend"   # 2–4 nights
+    SHORT = "short"       # 4–7 nights
+    MEDIUM = "medium"     # 7–14 nights
+    LONG = "long"         # 14–30 nights
+
+
+class DealCategory(str, Enum):
+    WEEKEND_ESCAPE = "Weekend Escape"
+    BUDGET_CITY_BREAK = "Budget City Break"
+    BEACH_HOLIDAY = "Beach Holiday"
+    LONG_HAUL_ADVENTURE = "Long-Haul Adventure"
+    LUXURY_DISCOUNT = "Luxury Discount"
+    ERROR_FARE = "Error Fare"
+    PACKAGE_ARBITRAGE = "Package Arbitrage"
+    HOTEL_STEAL = "Hotel Steal"
+    FLIGHT_STEAL = "Flight Steal"
+
+
+class BookingConfidence(str, Enum):
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+
 class FlightLeg(BaseModel):
     origin: str
     destination: str
@@ -50,6 +75,7 @@ class HotelDeal(BaseModel):
     total_price_eur: float
     rating: Optional[float] = None
     stars: Optional[int] = None
+    review_count: Optional[int] = None
     booking_url: Optional[str] = None
     source: str = ""
     data_confidence_score: float = Field(ge=0.0, le=1.0, default=0.5)
@@ -58,6 +84,7 @@ class HotelDeal(BaseModel):
     raw_price_per_night: float = 0.0
     check_in: Optional[date] = None
     check_out: Optional[date] = None
+    meets_quality_threshold: bool = True
 
     @model_validator(mode="after")
     def validate_total(self) -> "HotelDeal":
@@ -107,6 +134,20 @@ class Trip(BaseModel):
     alert_tier: AlertTier = AlertTier.ARCHIVE
     is_error_fare: bool = False
     verdict: str = "MONITOR"
+
+    # Extended classification
+    category: Optional[DealCategory] = None
+    booking_confidence: BookingConfidence = BookingConfidence.LOW
+    trip_length_profile: Optional[TripLengthProfile] = None
+
+    # Feasibility
+    is_feasible: bool = True
+    feasibility_notes: List[str] = Field(default_factory=list)
+
+    # Historical analytics
+    avg_historical_price_eur: Optional[float] = None
+    historical_deviation_pct: Optional[float] = None
+    is_historical_low: bool = False
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
     hash: str = ""
@@ -187,3 +228,5 @@ class ScraperParams(BaseModel):
     nights_max: int = 7
     adults: int = 1
     max_price_eur: float = 2000.0
+    trip_length_profile: Optional[TripLengthProfile] = None
+    flexible_dates: bool = True
