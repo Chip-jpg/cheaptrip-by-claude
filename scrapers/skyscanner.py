@@ -115,4 +115,6 @@ class SkyscannerScraper(BaseFlightScraper):
             for r in gathered:
                 if isinstance(r, list):
                     results.extend(r)
+                elif isinstance(r, Exception):
+                    log.warning("skyscanner_pair_failed", error=str(r))
         return results
