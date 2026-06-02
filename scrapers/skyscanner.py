@@ -16,9 +16,13 @@ log = get_logger(__name__)
 
 _DEFAULT_ENDPOINT = "/api/v1/searchFlights"
 
-# Each RapidAPI Skyscanner provider uses a different endpoint + parameter scheme.
-# We probe combinations of (endpoint, param_scheme) until one returns 200.
-_ENDPOINT_CANDIDATES = [
+_AIRPORT_SEARCH_PATHS = [
+    "/flights/searchAirport",
+    "/api/v1/flights/searchAirport",
+    "/api/v2/flights/searchAirport",
+]
+
+_FLIGHT_SEARCH_PATHS = [
     "/flights/searchFlights",
     "/api/v1/searchFlights",
     "/api/v1/flights/searchFlights",
@@ -27,67 +31,16 @@ _ENDPOINT_CANDIDATES = [
     "/search",
 ]
 
-# Different parameter naming conventions used by various Skyscanner RapidAPI providers
-_PARAM_SCHEMES: List[Dict[str, str]] = [
-    # Scheme A: originSkyId / destinationSkyId (skyscanner-flights-travel-api)
-    {
-        "origin_key": "originSkyId",
-        "dest_key": "destinationSkyId",
-        "date_key": "date",
-        "return_key": "returnDate",
-        "adults_key": "adults",
-        "currency_key": "currency",
-    },
-    # Scheme B: origin / destination (skyscanner50, sky-scrapper)
-    {
-        "origin_key": "origin",
-        "dest_key": "destination",
-        "date_key": "date",
-        "return_key": "returnDate",
-        "adults_key": "adults",
-        "currency_key": "currency",
-    },
-    # Scheme C: fromEntityId / toEntityId
-    {
-        "origin_key": "fromEntityId",
-        "dest_key": "toEntityId",
-        "date_key": "departDate",
-        "return_key": "returnDate",
-        "adults_key": "adults",
-        "currency_key": "currency",
-    },
-]
-
-
-def _build_params(
-    scheme: Dict[str, str],
-    origin: str,
-    destination: str,
-    dep_date: date,
-    return_date: Optional[date],
-    adults: int,
-) -> dict:
-    params = {
-        scheme["origin_key"]: origin,
-        scheme["dest_key"]: destination,
-        scheme["date_key"]: dep_date.strftime("%Y-%m-%d"),
-        scheme["adults_key"]: str(adults),
-        scheme["currency_key"]: "EUR",
-    }
-    if return_date:
-        params[scheme["return_key"]] = return_date.strftime("%Y-%m-%d")
-    return params
-
 
 class SkyscannerScraper(BaseFlightScraper):
     """Skyscanner via RapidAPI.
 
-    On first call, probes combinations of endpoint paths and parameter naming
-    schemes to discover the correct API contract. Caches the working combination
-    for the session.
+    On first call, discovers the working API contract in two phases:
+    1. Find the airport-search endpoint and resolve IATA → entity IDs
+    2. Find the flight-search endpoint using resolved entity IDs
 
-    Override with RAPIDAPI_SKYSCANNER_ENDPOINT in .env to skip endpoint probing
-    (parameter scheme probing still runs).
+    Many RapidAPI Skyscanner providers require both sky IDs (IATA codes)
+    and numeric entity IDs. Without entity IDs, the search returns 422.
     """
 
     source_id = "skyscanner_api"
@@ -97,8 +50,9 @@ class SkyscannerScraper(BaseFlightScraper):
         self._key = settings.rapidapi_key
         self._host = settings.rapidapi_skyscanner_host
         self._configured_endpoint = settings.rapidapi_skyscanner_endpoint
-        self._discovered_endpoint: Optional[str] = None
-        self._discovered_scheme: Optional[Dict[str, str]] = None
+        self._search_endpoint: Optional[str] = None
+        self._airport_endpoint: Optional[str] = None
+        self._entity_cache: Dict[str, str] = {}
         self._probed = False
         self.enabled = bool(self._key)
         self._logged_sample = False
@@ -109,49 +63,181 @@ class SkyscannerScraper(BaseFlightScraper):
             "X-RapidAPI-Host": self._host,
         }
 
-    async def _probe(self, client: httpx.AsyncClient) -> Tuple[Optional[str], Optional[Dict[str, str]]]:
-        """Try combinations of endpoints × param schemes until one returns 200.
+    # ── Airport resolution ──────────────────────────────────────────────────
 
-        Returns (endpoint, param_scheme) or (None, None) if all fail.
-        """
-        user_overrode = self._configured_endpoint != _DEFAULT_ENDPOINT
-        endpoints = [self._configured_endpoint] if user_overrode else _ENDPOINT_CANDIDATES
-
-        for endpoint in endpoints:
-            url = f"https://{self._host}{endpoint}"
-            for scheme in _PARAM_SCHEMES:
-                test_params = _build_params(
-                    scheme, "MXP", "LHR", date(2026, 7, 1), None, 1
+    async def _find_airport_endpoint(self, client: httpx.AsyncClient) -> Optional[str]:
+        for path in _AIRPORT_SEARCH_PATHS:
+            url = f"https://{self._host}{path}"
+            try:
+                resp = await client.get(
+                    url,
+                    params={"query": "London", "locale": "en-US"},
+                    headers=self._headers(),
                 )
-                try:
-                    resp = await client.get(url, params=test_params, headers=self._headers())
-                    if resp.status_code == 404:
-                        break  # endpoint doesn't exist, try next endpoint
-                    if resp.status_code == 200:
-                        log.info(
-                            "skyscanner_api_discovered",
-                            endpoint=endpoint,
-                            param_scheme=scheme["origin_key"],
-                            status=200,
-                        )
-                        return endpoint, scheme
-                    # 422/400 = endpoint exists but wrong params, try next scheme
-                    if resp.status_code in (422, 400):
-                        continue
-                    # 429 = rate limited, endpoint + scheme probably correct
-                    if resp.status_code == 429:
-                        log.info(
-                            "skyscanner_api_discovered",
-                            endpoint=endpoint,
-                            param_scheme=scheme["origin_key"],
-                            status=429,
-                            note="rate limited but endpoint confirmed",
-                        )
-                        return endpoint, scheme
-                except Exception:
-                    continue
+                if resp.status_code in (200, 429):
+                    log.info("skyscanner_airport_endpoint", path=path, status=resp.status_code)
+                    return path
+            except Exception:
+                continue
+        return None
 
-        return None, None
+    async def _resolve_entity_id(self, client: httpx.AsyncClient, iata: str) -> Optional[str]:
+        if iata in self._entity_cache:
+            return self._entity_cache[iata]
+        if not self._airport_endpoint:
+            return None
+
+        url = f"https://{self._host}{self._airport_endpoint}"
+        try:
+            resp = await client.get(
+                url,
+                params={"query": iata, "locale": "en-US"},
+                headers=self._headers(),
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            places = data.get("data") or data.get("results") or data.get("places") or []
+
+            for place in places:
+                entity_id = self._extract_entity_id(place, iata)
+                if entity_id:
+                    self._entity_cache[iata] = entity_id
+                    return entity_id
+
+            if places:
+                entity_id = self._extract_entity_id(places[0])
+                if entity_id:
+                    self._entity_cache[iata] = entity_id
+                    return entity_id
+        except Exception as exc:
+            log.debug("skyscanner_resolve_failed", iata=iata, error=str(exc))
+        return None
+
+    @staticmethod
+    def _extract_entity_id(place: dict, match_iata: Optional[str] = None) -> Optional[str]:
+        sky_id = place.get("skyId") or place.get("iata") or place.get("id", "")
+        if match_iata and sky_id.upper() != match_iata.upper():
+            nav = place.get("navigation", {})
+            sky_from_nav = nav.get("relevantFlightParams", {}).get("skyId", "")
+            if sky_from_nav.upper() != match_iata.upper():
+                return None
+
+        for key_path in [
+            ("entityId",),
+            ("entity_id",),
+            ("navigation", "entityId"),
+            ("navigation", "relevantFlightParams", "entityId"),
+        ]:
+            obj = place
+            for k in key_path:
+                if isinstance(obj, dict):
+                    obj = obj.get(k)
+                else:
+                    obj = None
+                    break
+            if obj is not None:
+                return str(obj)
+        return None
+
+    # ── Endpoint probing ────────────────────────────────────────────────────
+
+    def _build_search_params(
+        self,
+        origin: str,
+        destination: str,
+        dep_date: date,
+        return_date: Optional[date],
+        adults: int,
+        origin_entity: Optional[str] = None,
+        dest_entity: Optional[str] = None,
+    ) -> dict:
+        params: dict = {
+            "originSkyId": origin,
+            "destinationSkyId": destination,
+            "date": dep_date.strftime("%Y-%m-%d"),
+            "adults": str(adults),
+            "currency": "EUR",
+            "market": "IT",
+            "locale": "en-US",
+            "cabinClass": "economy",
+        }
+        if origin_entity:
+            params["originEntityId"] = origin_entity
+        if dest_entity:
+            params["destinationEntityId"] = dest_entity
+        if return_date:
+            params["returnDate"] = return_date.strftime("%Y-%m-%d")
+        return params
+
+    async def _probe_search_endpoint(
+        self,
+        client: httpx.AsyncClient,
+        origin_entity: Optional[str],
+        dest_entity: Optional[str],
+    ) -> Optional[str]:
+        user_overrode = self._configured_endpoint != _DEFAULT_ENDPOINT
+        paths = [self._configured_endpoint] if user_overrode else _FLIGHT_SEARCH_PATHS
+
+        best_422_path: Optional[str] = None
+
+        for path in paths:
+            url = f"https://{self._host}{path}"
+            params = self._build_search_params(
+                "MXP", "LHR", date(2026, 7, 1), None, 1,
+                origin_entity, dest_entity,
+            )
+            try:
+                resp = await client.get(url, params=params, headers=self._headers())
+                if resp.status_code == 404:
+                    continue
+                if resp.status_code == 200:
+                    log.info("skyscanner_search_endpoint", path=path, status=200)
+                    return path
+                if resp.status_code == 429:
+                    log.info("skyscanner_search_endpoint", path=path, status=429)
+                    return path
+                if resp.status_code in (400, 422):
+                    try:
+                        body = resp.json()
+                    except Exception:
+                        body = resp.text[:300]
+                    log.info(
+                        "skyscanner_probe_rejected",
+                        path=path,
+                        status=resp.status_code,
+                        body=str(body)[:300],
+                    )
+                    if best_422_path is None:
+                        best_422_path = path
+            except Exception:
+                continue
+
+        if best_422_path:
+            log.warning(
+                "skyscanner_using_422_endpoint",
+                path=best_422_path,
+                note="Best available — returned 422, may need different params",
+            )
+            return best_422_path
+        return None
+
+    async def _probe(self, client: httpx.AsyncClient) -> bool:
+        self._airport_endpoint = await self._find_airport_endpoint(client)
+
+        origin_entity = None
+        dest_entity = None
+        if self._airport_endpoint:
+            origin_entity = await self._resolve_entity_id(client, "MXP")
+            dest_entity = await self._resolve_entity_id(client, "LHR")
+            log.info("skyscanner_entities", mxp=origin_entity, lhr=dest_entity)
+
+        self._search_endpoint = await self._probe_search_endpoint(
+            client, origin_entity, dest_entity,
+        )
+        return self._search_endpoint is not None
+
+    # ── Actual search ───────────────────────────────────────────────────────
 
     @async_retry(
         max_attempts=3, min_wait=2.0, max_wait=16.0,
@@ -160,17 +246,22 @@ class SkyscannerScraper(BaseFlightScraper):
     async def _search_one_pair(
         self,
         client: httpx.AsyncClient,
-        base_url: str,
-        scheme: Dict[str, str],
         origin: str,
         destination: str,
         dep_date: date,
         return_date: Optional[date],
         adults: int,
     ) -> List[RawFlightResult]:
-        params = _build_params(scheme, origin, destination, dep_date, return_date, adults)
+        origin_entity = await self._resolve_entity_id(client, origin)
+        dest_entity = await self._resolve_entity_id(client, destination)
 
-        resp = await client.get(base_url, params=params, headers=self._headers())
+        url = f"https://{self._host}{self._search_endpoint}"
+        params = self._build_search_params(
+            origin, destination, dep_date, return_date, adults,
+            origin_entity, dest_entity,
+        )
+
+        resp = await client.get(url, params=params, headers=self._headers())
         resp.raise_for_status()
         data = resp.json()
 
@@ -179,11 +270,21 @@ class SkyscannerScraper(BaseFlightScraper):
             top_keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
             log.info(
                 "skyscanner_response_sample",
-                url=base_url,
+                url=url,
                 top_level_keys=top_keys,
                 preview=str(data)[:300],
             )
 
+        return self._parse_results(data, origin, destination, dep_date, return_date)
+
+    @staticmethod
+    def _parse_results(
+        data: dict,
+        origin: str,
+        destination: str,
+        dep_date: date,
+        return_date: Optional[date],
+    ) -> List[RawFlightResult]:
         results: List[RawFlightResult] = []
 
         itineraries = (
@@ -225,8 +326,12 @@ class SkyscannerScraper(BaseFlightScraper):
                         departure_date=dep_date,
                         return_date=return_date,
                         airline=airline,
-                        booking_url=item.get("deeplink") or item.get("url") or item.get("bookingUrl"),
-                        source=self.source_id,
+                        booking_url=(
+                            item.get("deeplink")
+                            or item.get("url")
+                            or item.get("bookingUrl")
+                        ),
+                        source="skyscanner_api",
                         extra={"raw": item},
                     )
                 )
@@ -239,30 +344,32 @@ class SkyscannerScraper(BaseFlightScraper):
         async with build_client(timeout=30.0) as client:
             if not self._probed:
                 self._probed = True
-                self._discovered_endpoint, self._discovered_scheme = await self._probe(client)
-                if not self._discovered_endpoint or not self._discovered_scheme:
+                found = await self._probe(client)
+                if not found:
                     log.error(
                         "skyscanner_no_working_api",
                         host=self._host,
-                        hint="No endpoint+parameter combination returned 200. "
-                             "Check your RapidAPI subscription and set RAPIDAPI_SKYSCANNER_ENDPOINT in .env",
+                        hint="No working endpoint found. Check your RapidAPI subscription "
+                             "and set RAPIDAPI_SKYSCANNER_ENDPOINT in .env",
                     )
                     self.enabled = False
                     return results
 
-            if not self._discovered_endpoint or not self._discovered_scheme:
+            if not self._search_endpoint:
                 return results
 
-            base_url = f"https://{self._host}{self._discovered_endpoint}"
             tasks = []
             for origin in params.origins[:3]:
                 for dest in params.destinations[:10]:
                     dep = params.departure_date_from
-                    ret_date = dep + timedelta(days=params.nights_min + 1) if params.nights_min else None
+                    ret_date = (
+                        dep + timedelta(days=params.nights_min + 1)
+                        if params.nights_min
+                        else None
+                    )
                     tasks.append(
                         self._search_one_pair(
-                            client, base_url, self._discovered_scheme,
-                            origin, dest, dep, ret_date, params.adults,
+                            client, origin, dest, dep, ret_date, params.adults,
                         )
                     )
             gathered = await asyncio.gather(*tasks, return_exceptions=True)
