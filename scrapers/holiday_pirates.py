@@ -21,6 +21,25 @@ _AIRPORT_RE = re.compile(r"\b([A-Z]{3})\b")
 _PRICE_RE = re.compile(r"(?:from\s+)?[€\$£]?\s*(\d{1,4}(?:[.,]\d{2})?)\s*(?:€|EUR|USD|GBP)?", re.I)
 _DISCOUNT_RE = re.compile(r"-\s*(\d{1,3})\s*%")
 
+_RSS_URLS = [
+    f"{_BASE}/feed/",
+    f"{_BASE}/rss/",
+    f"{_BASE}/feed/atom/",
+]
+
+_FLIGHT_DEAL_PATHS = [
+    "/deals/flights/",
+    "/flight-deals/",
+    "/flights/",
+    "/deals/",
+]
+
+_HOTEL_DEAL_PATHS = [
+    "/deals/hotels/",
+    "/hotel-deals/",
+    "/hotels/",
+]
+
 
 def _first_price(text: str) -> Optional[float]:
     for m in _PRICE_RE.finditer(text):
@@ -38,39 +57,95 @@ def _first_discount(text: str) -> Optional[float]:
     return float(m.group(1)) if m else None
 
 
-async def _discover_deal_urls(
+async def _try_rss_feed(
     client: httpx.AsyncClient,
 ) -> Tuple[List[str], List[str]]:
-    """Probe the homepage to discover current flight and hotel deal URLs."""
+    """Try RSS/Atom feeds — these often work even when HTML pages are blocked."""
     flight_urls: List[str] = []
     hotel_urls: List[str] = []
-    try:
-        resp = await client.get(_BASE, headers=random_headers(), follow_redirects=True)
-        if resp.status_code != 200:
-            return flight_urls, hotel_urls
-        soup = BeautifulSoup(resp.text, "lxml")
-        for link in soup.find_all("a", href=True):
-            href = link["href"]
-            text = (link.get_text(separator=" ") + " " + href).lower()
-            full_url = href if href.startswith("http") else urljoin(_BASE, href)
-            if _BASE not in full_url:
+
+    for feed_url in _RSS_URLS:
+        try:
+            resp = await client.get(feed_url, headers=random_headers(), follow_redirects=True)
+            if resp.status_code != 200:
                 continue
-            if any(kw in text for kw in ("flight", "fly", "flug", "voli")):
-                if full_url not in flight_urls:
-                    flight_urls.append(full_url)
-            if any(kw in text for kw in ("hotel", "stay", "accommodation")):
-                if full_url not in hotel_urls:
-                    hotel_urls.append(full_url)
-    except Exception as exc:
-        log.warning("hp_discovery_failed", error=str(exc))
+            content_type = resp.headers.get("content-type", "")
+            text = resp.text
+
+            if "xml" not in content_type and "<rss" not in text[:200] and "<feed" not in text[:200]:
+                continue
+
+            soup = BeautifulSoup(text, "lxml-xml") if "xml" in content_type else BeautifulSoup(text, "lxml")
+            items = soup.find_all("item") or soup.find_all("entry")
+
+            for item in items:
+                link_el = item.find("link")
+                link = ""
+                if link_el:
+                    link = link_el.get("href") or link_el.get_text(strip=True) or ""
+                title = item.find("title")
+                title_text = title.get_text(strip=True).lower() if title else ""
+                combined = f"{title_text} {link}".lower()
+
+                if any(kw in combined for kw in ("flight", "fly", "flug", "voli")):
+                    if link and link not in flight_urls:
+                        flight_urls.append(link)
+                if any(kw in combined for kw in ("hotel", "stay", "accommodation")):
+                    if link and link not in hotel_urls:
+                        hotel_urls.append(link)
+
+            if flight_urls or hotel_urls:
+                log.info("hp_rss_feed_found", url=feed_url, flights=len(flight_urls), hotels=len(hotel_urls))
+                break
+        except Exception:
+            continue
+
     return flight_urls[:5], hotel_urls[:5]
 
 
-class HolidayPiratesFlightScraper(BaseFlightScraper):
-    """Scrapes HolidayPirates flight deals page.
+async def _discover_deal_urls(
+    client: httpx.AsyncClient,
+) -> Tuple[List[str], List[str]]:
+    """Discover deal URLs: try RSS first, then homepage links, then known paths."""
+    flight_urls, hotel_urls = await _try_rss_feed(client)
+    if flight_urls or hotel_urls:
+        return flight_urls, hotel_urls
 
-    Discovers deal URLs from the homepage before trying hardcoded paths.
-    Disables itself for the session if nothing works.
+    try:
+        resp = await client.get(_BASE, headers=random_headers(), follow_redirects=True)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "lxml")
+            for link in soup.find_all("a", href=True):
+                href = link["href"]
+                text = (link.get_text(separator=" ") + " " + href).lower()
+                full_url = href if href.startswith("http") else urljoin(_BASE, href)
+                if _BASE not in full_url:
+                    continue
+                if any(kw in text for kw in ("flight", "fly", "flug", "voli")):
+                    if full_url not in flight_urls:
+                        flight_urls.append(full_url)
+                if any(kw in text for kw in ("hotel", "stay", "accommodation")):
+                    if full_url not in hotel_urls:
+                        hotel_urls.append(full_url)
+    except Exception as exc:
+        log.debug("hp_homepage_failed", error=str(exc))
+
+    if flight_urls or hotel_urls:
+        return flight_urls[:5], hotel_urls[:5]
+
+    for path in _FLIGHT_DEAL_PATHS:
+        flight_urls.append(f"{_BASE}{path}")
+    for path in _HOTEL_DEAL_PATHS:
+        hotel_urls.append(f"{_BASE}{path}")
+
+    return flight_urls, hotel_urls
+
+
+class HolidayPiratesFlightScraper(BaseFlightScraper):
+    """Scrapes HolidayPirates flight deals.
+
+    Tries RSS feed first (bypasses bot protection), then homepage discovery,
+    then known deal paths as fallback.
     """
 
     source_id = "holiday_pirates"
@@ -134,11 +209,9 @@ class HolidayPiratesFlightScraper(BaseFlightScraper):
     async def scrape(self, params: ScraperParams) -> List[RawFlightResult]:
         results: List[RawFlightResult] = []
         async with build_client(timeout=20.0) as client:
-            # Discover URLs from homepage
             discovered_flights, _ = await _discover_deal_urls(client)
-            urls_to_try = discovered_flights
 
-            for url in urls_to_try:
+            for url in discovered_flights:
                 try:
                     html = await self._fetch(client, url)
                     if html:
@@ -149,19 +222,13 @@ class HolidayPiratesFlightScraper(BaseFlightScraper):
                 except Exception as exc:
                     log.debug("hp_flight_url_failed", url=url, error=str(exc))
 
-            if not results and not urls_to_try:
-                log.warning(
-                    "hp_flight_no_working_urls",
-                    reason="Homepage discovery found no flight deal links",
-                )
+            if not results:
+                log.info("hp_flight_no_results", urls_tried=len(discovered_flights))
         return results
 
 
 class HolidayPiratesHotelScraper(BaseHotelScraper):
-    """Scrapes HolidayPirates hotel deal pages.
-
-    Discovers deal URLs from the homepage before trying hardcoded paths.
-    """
+    """Scrapes HolidayPirates hotel deal pages."""
 
     source_id = "holiday_pirates"
 
@@ -214,9 +281,8 @@ class HolidayPiratesHotelScraper(BaseHotelScraper):
         results: List[RawHotelResult] = []
         async with build_client(timeout=20.0) as client:
             _, discovered_hotels = await _discover_deal_urls(client)
-            urls_to_try = discovered_hotels
 
-            for url in urls_to_try:
+            for url in discovered_hotels:
                 try:
                     html = await self._fetch(client, url)
                     if html:
@@ -233,9 +299,6 @@ class HolidayPiratesHotelScraper(BaseHotelScraper):
                 except Exception as exc:
                     log.debug("hp_hotel_url_failed", url=url, error=str(exc))
 
-            if not results and not urls_to_try:
-                log.warning(
-                    "hp_hotel_no_working_urls",
-                    reason="Homepage discovery found no hotel deal links",
-                )
+            if not results:
+                log.info("hp_hotel_no_results", urls_tried=len(discovered_hotels))
         return results
