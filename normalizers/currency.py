@@ -153,7 +153,8 @@ class CurrencyConverter:
             return round(amount, 2)
 
         rates = self._live_rates or _FALLBACK_RATES
-        eur_per_currency = 1.0 / rates.get(currency, 1.0)
+        rate = rates.get(currency, 1.0) or 1.0
+        eur_per_currency = 1.0 / rate
         return round(amount * eur_per_currency, 2)
 
     async def ensure_fresh(self) -> None:

@@ -37,10 +37,11 @@ def run() -> None:
 def cycle() -> None:
     """Run a single scraping + alert cycle and exit."""
     from storage.database import init_db
-    from scheduler.runner import run_pipeline_cycle
+    from scheduler.runner import init_notifier, run_pipeline_cycle
 
     async def _run():
         await init_db()
+        await init_notifier()
         await run_pipeline_cycle()
 
     asyncio.run(_run())
@@ -50,10 +51,11 @@ def cycle() -> None:
 def digest() -> None:
     """Send today's deal digest and exit."""
     from storage.database import init_db
-    from scheduler.runner import run_daily_digest
+    from scheduler.runner import init_notifier, run_daily_digest
 
     async def _run():
         await init_db()
+        await init_notifier()
         await run_daily_digest()
 
     asyncio.run(_run())

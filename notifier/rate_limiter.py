@@ -61,23 +61,23 @@ class RateLimiter:
         while queue and queue[0] < cutoff:
             queue.popleft()
 
-    async def can_send_instant(self) -> bool:
+    async def try_send_instant(self) -> bool:
+        """Atomically check quota and reserve a slot. Returns True if slot was acquired."""
         async with self._lock:
             self._prune_old(self._instant_sent, timedelta(hours=1))
-            return len(self._instant_sent) < self._instant_max
+            if len(self._instant_sent) < self._instant_max:
+                self._instant_sent.append(datetime.utcnow())
+                return True
+            return False
 
-    async def can_send_digest(self) -> bool:
+    async def try_send_digest(self) -> bool:
+        """Atomically check quota and reserve a digest slot. Returns True if slot was acquired."""
         async with self._lock:
             self._prune_old(self._digest_sent, timedelta(hours=24))
-            return len(self._digest_sent) == 0
-
-    async def record_instant(self) -> None:
-        async with self._lock:
-            self._instant_sent.append(datetime.utcnow())
-
-    async def record_digest(self) -> None:
-        async with self._lock:
-            self._digest_sent.append(datetime.utcnow())
+            if len(self._digest_sent) == 0:
+                self._digest_sent.append(datetime.utcnow())
+                return True
+            return False
 
     async def instant_remaining(self) -> int:
         async with self._lock:

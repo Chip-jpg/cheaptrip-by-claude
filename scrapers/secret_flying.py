@@ -138,9 +138,10 @@ class SecretFlyingScraper(BaseFlightScraper):
                 except Exception as exc:
                     log.warning("sf_page_failed", path=path, error=str(exc))
 
-        # Filter to deals with relevant origins or all if none match
+        # Filter to deals with relevant origins; return empty list if none match
+        # (returning all results on fallback would flood the pipeline with irrelevant deals)
         italy_relevant = [
             r for r in results
             if r.origin in _ITALY_AIRPORTS or r.destination in _ITALY_AIRPORTS
         ]
-        return italy_relevant if italy_relevant else results
+        return italy_relevant

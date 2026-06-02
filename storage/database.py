@@ -9,6 +9,9 @@ import aiosqlite
 
 from config import get_settings
 from storage.models import AlertTier, Trip
+from utils.logging_config import get_logger
+
+log = get_logger(__name__)
 
 
 _CREATE_DEALS_TABLE = """
@@ -180,7 +183,13 @@ async def get_pending_instant_alerts(limit: int = 10) -> List[Trip]:
             (AlertTier.INSTANT, limit),
         )
         rows = await cursor.fetchall()
-    return [Trip.model_validate_json(row[0]) for row in rows]
+    trips = []
+    for row in rows:
+        try:
+            trips.append(Trip.model_validate_json(row[0]))
+        except Exception:
+            log.warning("corrupted_trip_payload_skipped", preview=row[0][:20] if row[0] else "?")
+    return trips
 
 
 async def get_digest_deals(limit: int = 20) -> List[Trip]:
@@ -198,7 +207,13 @@ async def get_digest_deals(limit: int = 20) -> List[Trip]:
             (AlertTier.INSTANT, AlertTier.DIGEST, cutoff, limit),
         )
         rows = await cursor.fetchall()
-    return [Trip.model_validate_json(row[0]) for row in rows]
+    trips = []
+    for row in rows:
+        try:
+            trips.append(Trip.model_validate_json(row[0]))
+        except Exception:
+            log.warning("corrupted_trip_payload_skipped", preview=row[0][:20] if row[0] else "?")
+    return trips
 
 
 async def record_price(route: str, price_eur: float, source: str) -> None:

@@ -6,6 +6,7 @@ No AI involved. Categories drive Telegram display labels.
 """
 from __future__ import annotations
 
+from preferences import get_preferences
 from storage.models import DealCategory, DealType, Trip, TripLengthProfile
 
 # ── Destination sets ──────────────────────────────────────────────────────────
@@ -47,6 +48,7 @@ def categorize_trip(trip: Trip) -> DealCategory:
     discount = trip.discount_pct or 0.0
     has_hotel = trip.hotel is not None
     hotel_rating = (trip.hotel.rating or 0.0) if has_hotel else 0.0
+    prefs = get_preferences()
 
     # 1. Error fare — highest priority
     if trip.is_error_fare:
@@ -65,7 +67,7 @@ def categorize_trip(trip: Trip) -> DealCategory:
         return DealCategory.PACKAGE_ARBITRAGE
 
     # 5. Luxury discount: high-rated hotel with meaningful discount
-    if has_hotel and hotel_rating >= 4.0 and discount >= 30.0:
+    if has_hotel and hotel_rating >= prefs.preferred_hotel_rating and discount >= 30.0:
         return DealCategory.LUXURY_DISCOUNT
 
     # 6. Long-haul adventure

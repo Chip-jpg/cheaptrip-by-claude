@@ -35,10 +35,8 @@ def apply_time_decay(trips: List[Trip]) -> Tuple[List[Trip], List[Trip], List[Tr
             age_hours = (now - trip.created_at).total_seconds() / 3600
 
         if age_hours <= DECAY_INSTANT_CUTOFF:
-            if trip.alert_tier == AlertTier.INSTANT:
-                instant.append(trip)
-            else:
-                digest.append(trip)
+            trip.alert_tier = AlertTier.INSTANT
+            instant.append(trip)
         elif age_hours <= DECAY_DIGEST_CUTOFF:
             trip.alert_tier = AlertTier.DIGEST
             digest.append(trip)

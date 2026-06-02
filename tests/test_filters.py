@@ -125,3 +125,10 @@ class TestTimeDecay:
         trip.alert_tier = AlertTier.DIGEST
         instant, digest, archive = apply_time_decay([trip])
         assert len(digest) == 1
+
+    def test_fresh_digest_promoted_to_instant(self):
+        trip = _make_flight_trip("MXP", "KRK", 85.0, scraped_age_hours=1.0)
+        trip.alert_tier = AlertTier.DIGEST
+        instant, digest, archive = apply_time_decay([trip])
+        assert len(instant) == 1
+        assert instant[0].alert_tier == AlertTier.INSTANT

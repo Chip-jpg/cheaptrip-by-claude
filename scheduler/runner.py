@@ -33,6 +33,12 @@ _notifier = TelegramNotifier()
 _aggregator = ScraperAggregator()
 
 
+async def init_notifier() -> None:
+    """Re-initialize the notifier with DB-restored rate limiter state."""
+    global _notifier
+    _notifier = await TelegramNotifier.create()
+
+
 async def run_pipeline_cycle() -> None:
     """
     Full pipeline execution:
@@ -76,12 +82,19 @@ async def run_pipeline_cycle() -> None:
         all_raw_hotels = []
 
         for params in param_batches:
-            (raw_flights, _), (raw_hotels, _) = await asyncio.gather(
+            flight_result, hotel_result = await asyncio.gather(
                 _aggregator.collect_flights(params),
                 _aggregator.collect_hotels(params),
+                return_exceptions=True,
             )
-            all_raw_flights.extend(raw_flights)
-            all_raw_hotels.extend(raw_hotels)
+            if isinstance(flight_result, Exception):
+                log.warning("collect_flights_failed", error=str(flight_result))
+            else:
+                all_raw_flights.extend(flight_result[0])
+            if isinstance(hotel_result, Exception):
+                log.warning("collect_hotels_failed", error=str(hotel_result))
+            else:
+                all_raw_hotels.extend(hotel_result[0])
 
         log.info(
             "raw_collected",
@@ -90,10 +103,17 @@ async def run_pipeline_cycle() -> None:
         )
 
         # ── Normalize ─────────────────────────────────────────────────────────
-        flight_legs, hotel_deals = await asyncio.gather(
+        normalize_result = await asyncio.gather(
             normalize_flights(all_raw_flights),
             normalize_hotels(all_raw_hotels),
+            return_exceptions=True,
         )
+        flight_legs = normalize_result[0] if not isinstance(normalize_result[0], Exception) else []
+        hotel_deals = normalize_result[1] if not isinstance(normalize_result[1], Exception) else []
+        if isinstance(normalize_result[0], Exception):
+            log.warning("normalize_flights_failed", error=str(normalize_result[0]))
+        if isinstance(normalize_result[1], Exception):
+            log.warning("normalize_hotels_failed", error=str(normalize_result[1]))
 
         # ── Build trips ───────────────────────────────────────────────────────
         trips = await build_trips(flight_legs, hotel_deals)

@@ -52,10 +52,14 @@ class TelegramNotifier:
             log.warning("telegram_not_configured")
             return False
 
+        if len(text) > 4096:
+            log.warning("telegram_message_truncated", original_len=len(text))
+            text = text[:4090] + "\n…"
+
         url = f"{_TELEGRAM_API}/bot{self._token}/sendMessage"
         payload = {
             "chat_id": self._chat_id,
-            "text": text[:4096],  # Telegram max message length
+            "text": text,
             "parse_mode": parse_mode,
             "disable_web_page_preview": False,
         }
@@ -81,12 +85,12 @@ class TelegramNotifier:
             log.info("telegram_disabled_dry_run", route=trip.route, cost=trip.total_cost_eur)
             return False
 
-        if not await self._rate_limiter.can_send_instant():
-            log.info("rate_limit_instant_skipped", route=trip.route)
-            return False
-
         if await was_route_alerted_recently(trip.route, within_hours=6.0):
             log.info("route_recently_alerted_suppressed", route=trip.route)
+            return False
+
+        if not await self._rate_limiter.try_send_instant():
+            log.info("rate_limit_instant_skipped", route=trip.route)
             return False
 
         formatter = select_formatter(trip)
@@ -95,7 +99,6 @@ class TelegramNotifier:
 
         success = await self._send_raw(message)
         if success:
-            await self._rate_limiter.record_instant()
             await mark_alerted(trip.hash, AlertTier.INSTANT)
             log.info("instant_alert_sent", route=trip.route, cost=trip.total_cost_eur)
         return success
@@ -105,7 +108,7 @@ class TelegramNotifier:
             log.info("telegram_disabled_digest_dry_run", count=len(trips))
             return False
 
-        if not await self._rate_limiter.can_send_digest():
+        if not await self._rate_limiter.try_send_digest():
             log.info("rate_limit_digest_skipped")
             return False
 
@@ -115,7 +118,6 @@ class TelegramNotifier:
         message = format_digest(trips)
         success = await self._send_raw(message)
         if success:
-            await self._rate_limiter.record_digest()
             for trip in trips:
                 await mark_alerted(trip.hash, AlertTier.DIGEST)
             log.info("digest_sent", count=len(trips))

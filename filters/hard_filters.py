@@ -36,12 +36,19 @@ def apply_hard_filters(trips: List[Trip]) -> Tuple[List[Trip], List[Trip]]:
     """
     settings = get_settings()
     prefs = get_preferences()
+    excluded = set(prefs.excluded_destinations)
     instant: List[Trip] = []
     digest: List[Trip] = []
     discarded = 0
 
     for trip in trips:
         if trip.total_cost_eur <= 0:
+            discarded += 1
+            continue
+
+        # Excluded destinations: enforce on actual trip results (scrapers may return any airport)
+        dest = trip.outbound_flight.destination if trip.outbound_flight else ""
+        if dest and dest in excluded:
             discarded += 1
             continue
 

@@ -11,6 +11,7 @@ from config import (
     REPOSITIONING_MIN_SAVING_EUR,
     REPOSITIONING_MIN_SAVING_PCT,
 )
+from trip_builder.feasibility import estimate_travel_hours
 from storage.models import FlightLeg, RepositioningLeg
 from utils.logging_config import get_logger
 
@@ -119,11 +120,19 @@ def find_repositioning_opportunities(
                     if total_via_hub > 200:
                         continue
 
-                # Validate layover buffer
-                if onward.departure_date and hasattr(onward, "scraped_at"):
-                    # Can't verify real departure times without flight detail data;
-                    # assume layover is adequate when hub is on same date
-                    pass
+                # Validate layover buffer: if both flights are on the same date,
+                # estimated repo travel time + minimum layover must fit within the day.
+                repo_travel_h = estimate_travel_hours(origin, hub)
+                if repo_travel_h + REPOSITIONING_MIN_LAYOVER_HOURS > 20.0:
+                    # Too tight to reliably make the connection on the same day
+                    log.debug(
+                        "repo_layover_insufficient",
+                        origin=origin,
+                        hub=hub,
+                        repo_h=repo_travel_h,
+                        min_layover_h=REPOSITIONING_MIN_LAYOVER_HOURS,
+                    )
+                    continue
 
                 repo_leg = RepositioningLeg(
                     origin=origin,
