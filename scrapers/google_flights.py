@@ -17,25 +17,25 @@ from utils.retry import async_retry
 
 log = get_logger(__name__)
 
-# Google Flights Explore endpoint — publicly accessible, returns JSON-LD + embedded data
-_GF_BASE = "https://www.google.com/travel/flights"
-_EXPLORE_BASE = "https://www.google.com/flights/explore"
-
 
 class GoogleFlightsScraper(BaseFlightScraper):
     """
     Google Flights HTML scraper.
 
-    Approach: uses Google Flights' URL scheme to load the search results page,
-    then extracts structured data from the JSON-LD script tags and inline data
-    objects embedded by Google. Falls back to best-effort HTML parsing.
+    Uses Google Flights' URL scheme to load search results, then extracts
+    structured data from JSON-LD script tags and inline JS data objects.
+    Falls back to best-effort regex parsing.
 
     No API key required — uses public web interface.
+    May return 0 results if Google detects bot traffic.
     """
 
     source_id = "google_flights"
 
-    @async_retry(max_attempts=3, min_wait=3.0, max_wait=20.0)
+    @async_retry(
+        max_attempts=3, min_wait=3.0, max_wait=20.0,
+        retry_on=(httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError),
+    )
     async def _fetch_search_page(
         self,
         client: httpx.AsyncClient,
@@ -44,27 +44,7 @@ class GoogleFlightsScraper(BaseFlightScraper):
         dep_date: date,
         return_date: Optional[date],
     ) -> Optional[str]:
-        dep_str = dep_date.strftime("%Y-%m-%d")
-        if return_date:
-            url = (
-                f"{_GF_BASE}?hl=en&gl=us"
-                f"&q=flights+from+{origin}+to+{dest}"
-                f"&tfs=CBcQARoaEgoyMDI0LTA1LTAxagcIARIDTVhQcgcIARIDTlJT"  # placeholder
-            )
-            # Use direct URL format that Google Flights supports
-            url = (
-                f"https://www.google.com/travel/flights/search?"
-                f"tfs=CBcQARoaEgoyMDI1LTA1LTAxagcIARID{origin}cgcIARID{dest}"
-                f"&hl=en"
-            )
-        else:
-            url = (
-                f"{_GF_BASE}?hl=en&curr=EUR"
-                f"&tfs=CBcQAhoaEgoyMDI1LTA1LTAxagcIARID{origin}cgcIARID{dest}"
-            )
-
-        # Build a direct search URL using the well-known format
-        dep_encoded = dep_str.replace("-", "")
+        dep_encoded = dep_date.strftime("%Y%m%d")
         if return_date:
             ret_encoded = return_date.strftime("%Y%m%d")
             url = (
@@ -117,7 +97,7 @@ class GoogleFlightsScraper(BaseFlightScraper):
         prices = [float(m.group(1)) for m in price_pattern.finditer(html)]
         airlines = [m.group(1) for m in airline_pattern.finditer(html)]
 
-        for i, price in enumerate(prices[:5]):  # take top 5 from page
+        for i, price in enumerate(prices[:5]):
             if price < 20 or price > 5000:
                 continue
             airline = airlines[i] if i < len(airlines) else None
@@ -166,7 +146,6 @@ class GoogleFlightsScraper(BaseFlightScraper):
                     ret = dep + timedelta(days=params.nights_min + 1) if params.nights_min else None
                     tasks.append((origin, dest, dep, ret))
 
-            # Stagger requests to avoid triggering bot detection
             for origin, dest, dep, ret in tasks:
                 try:
                     html = await self._fetch_search_page(client, origin, dest, dep, ret)

@@ -114,9 +114,12 @@ async def build_trips(
     trips: List[Trip] = []
 
     # Record prices for historical tracking and keep price_stats fresh
+    routes_seen: set[str] = set()
     for leg in flight_legs:
         route = f"{leg.origin}-{leg.destination}"
         await record_price(route, leg.price_eur, leg.source)
+        routes_seen.add(route)
+    for route in routes_seen:
         await update_price_stats(route)
 
     # ── 1. Direct flight-only deals ──────────────────────────────────────────
@@ -205,11 +208,14 @@ async def _build_flight_only_trip(leg: FlightLeg) -> Optional[Trip]:
         trip.alert_tier = AlertTier.INSTANT
 
     # Historical anomaly check
-    anomaly = await detect_anomaly(f"{leg.origin}-{leg.destination}", leg.price_eur)
-    if anomaly.is_anomaly:
-        _apply_anomaly_to_trip(trip, anomaly)
-        if anomaly.description:
-            trip.verdict = f"{trip.verdict} (Historical anomaly: {anomaly.description})"
+    try:
+        anomaly = await detect_anomaly(f"{leg.origin}-{leg.destination}", leg.price_eur)
+        if anomaly.is_anomaly:
+            _apply_anomaly_to_trip(trip, anomaly)
+            if anomaly.description:
+                trip.verdict = f"{trip.verdict} (Historical anomaly: {anomaly.description})"
+    except Exception:
+        log.warning("anomaly_check_failed", route=f"{leg.origin}-{leg.destination}")
 
     _finalize_trip(trip)
     return trip
@@ -253,9 +259,12 @@ async def _build_complete_trip(leg: FlightLeg, hotel: HotelDeal) -> Optional[Tri
     trip.alert_tier = _assign_alert_tier(trip)
 
     # Historical anomaly on the flight leg
-    anomaly = await detect_anomaly(f"{leg.origin}-{leg.destination}", leg.price_eur)
-    if anomaly.is_anomaly:
-        _apply_anomaly_to_trip(trip, anomaly)
+    try:
+        anomaly = await detect_anomaly(f"{leg.origin}-{leg.destination}", leg.price_eur)
+        if anomaly.is_anomaly:
+            _apply_anomaly_to_trip(trip, anomaly)
+    except Exception:
+        log.warning("anomaly_check_failed", route=f"{leg.origin}-{leg.destination}")
 
     _finalize_trip(trip)
     return trip

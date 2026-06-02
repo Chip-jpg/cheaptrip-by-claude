@@ -203,7 +203,7 @@ def create_scheduler() -> AsyncIOScheduler:
         trigger=CronTrigger(
             hour=settings.digest_hour,
             minute=settings.digest_minute,
-            timezone="Europe/Rome",
+            timezone="UTC",
         ),
         id="daily_digest",
         name="Daily deal digest",

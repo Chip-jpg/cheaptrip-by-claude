@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
 import httpx
+from bs4 import BeautifulSoup
 
 from config import get_settings
+from normalizers.currency import AIRPORT_TO_CITY
 from scrapers.base import BaseHotelScraper, build_client, random_headers
 from storage.models import RawHotelResult, ScraperParams
 from utils.logging_config import get_logger
@@ -15,9 +18,6 @@ from utils.retry import async_retry
 
 log = get_logger(__name__)
 
-# Booking.com Affiliate API v2
-_AFFILIATE_BASE = "https://distribution-xml.booking.com/2.0/json"
-# Fallback: public search endpoint
 _SEARCH_BASE = "https://www.booking.com/searchresults.html"
 
 
@@ -25,20 +25,19 @@ class BookingComScraper(BaseHotelScraper):
     """
     Hotel scraper using Booking.com's public search interface.
 
-    If an affiliate API key is configured, uses the authenticated endpoint.
-    Otherwise falls back to HTML scraping of public search results.
+    Falls back to HTML scraping of public search results.
     """
 
     source_id = "booking_com_api"
 
     def __init__(self) -> None:
-        settings = get_settings()
-        # Booking.com affiliate key stored in env as BOOKING_COM_API_KEY (optional)
-        import os
         self._affiliate_key = os.getenv("BOOKING_COM_API_KEY", "")
         self.enabled = True
 
-    @async_retry(max_attempts=3, min_wait=2.0, max_wait=20.0)
+    @async_retry(
+        max_attempts=3, min_wait=2.0, max_wait=20.0,
+        retry_on=(httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError),
+    )
     async def _search_html(
         self,
         client: httpx.AsyncClient,
@@ -58,7 +57,7 @@ class BookingComScraper(BaseHotelScraper):
             "group_adults": str(adults),
             "no_rooms": "1",
             "order": "price",
-            "nflt": "ht_id%3D204",  # hotels only
+            "nflt": "ht_id%3D204",
             "lang": "en-gb",
             "selected_currency": "EUR",
         }
@@ -73,14 +72,11 @@ class BookingComScraper(BaseHotelScraper):
     def _parse_html_results(
         self, html: str, location: str, nights: int, checkin: date
     ) -> List[RawHotelResult]:
-        from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "lxml")
         results: List[RawHotelResult] = []
 
-        # Booking.com uses data-testid attributes in newer DOM
         cards = soup.find_all("div", {"data-testid": "property-card"})
         if not cards:
-            # Fallback to class-based selectors
             cards = soup.find_all("div", class_=re.compile(r"sr_property_block|hotel_namecontainer"))
 
         for card in cards[:20]:
@@ -144,9 +140,6 @@ class BookingComScraper(BaseHotelScraper):
         checkin = params.departure_date_from
         checkout = checkin + timedelta(days=nights)
 
-        # Derive destination city names from destination airport codes
-        from config import POPULAR_DESTINATIONS
-        from normalizers.currency import AIRPORT_TO_CITY
         locations = []
         for dest in params.destinations[:5]:
             city = AIRPORT_TO_CITY.get(dest, dest)

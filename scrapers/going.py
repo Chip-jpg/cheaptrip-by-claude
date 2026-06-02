@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from datetime import date
 from typing import List, Optional
@@ -23,9 +24,22 @@ _FROM_RE = re.compile(r"from\s+\$(\d{1,4})", re.I)
 
 
 class GoingScraper(BaseFlightScraper):
-    """Scrapes Going (formerly Scott's Cheap Flights) public deal feed."""
+    """Scrapes Going (formerly Scott's Cheap Flights) public deal feed.
+
+    Disabled by default — site is a JavaScript SPA with no server-rendered content.
+    Set ENABLE_GOING=true in .env to attempt anyway.
+    """
 
     source_id = "going"
+
+    def __init__(self) -> None:
+        self.enabled = os.getenv("ENABLE_GOING", "").lower() in ("true", "1", "yes")
+        if not self.enabled:
+            log.info(
+                "scraper_disabled",
+                source=self.source_id,
+                reason="JavaScript SPA — deals are loaded client-side, not via HTTP",
+            )
 
     @async_retry(
         max_attempts=3, min_wait=2.0, max_wait=15.0,

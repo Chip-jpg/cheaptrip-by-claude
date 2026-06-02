@@ -14,41 +14,83 @@ from utils.retry import async_retry
 
 log = get_logger(__name__)
 
+# Known endpoint patterns across various Skyscanner RapidAPI providers
+_ENDPOINT_CANDIDATES = [
+    "/api/v1/searchFlights",
+    "/api/v1/flights/searchFlights",
+    "/api/v2/flights/searchFlights",
+    "/flights/searchFlights",
+    "/flights/search-one-way",
+    "/search",
+]
+
+_DEFAULT_ENDPOINT = "/api/v1/searchFlights"
+
 
 class SkyscannerScraper(BaseFlightScraper):
     """Skyscanner via RapidAPI.
 
-    Endpoint is configurable via RAPIDAPI_SKYSCANNER_ENDPOINT in .env.
-    If you see 404s, open the "Endpoints" tab in your RapidAPI console and
-    set that value to the correct path (e.g. /api/v2/flights/search).
+    On first call, probes multiple known endpoint paths to discover which one
+    the subscribed API supports. Caches the working endpoint for the session.
+
+    Override with RAPIDAPI_SKYSCANNER_ENDPOINT in .env to skip probing.
     """
 
     source_id = "skyscanner_api"
-
-    # Known endpoint paths per RapidAPI host
-    _HOST_ENDPOINTS: dict = {
-        "skyscanner50.p.rapidapi.com":                    "/api/v1/searchFlights",
-        "skyscanner-flights-travel-api.p.rapidapi.com":   "/api/v1/flights/searchFlights",
-        "sky-scrapper.p.rapidapi.com":                    "/api/v2/flights/searchFlights",
-    }
 
     def __init__(self) -> None:
         settings = get_settings()
         self._key = settings.rapidapi_key
         self._host = settings.rapidapi_skyscanner_host
-        # Use per-host default unless the user explicitly overrode it in .env
-        configured = settings.rapidapi_skyscanner_endpoint
-        default_for_host = self._HOST_ENDPOINTS.get(self._host, configured)
-        self._endpoint = configured if configured != "/api/v1/searchFlights" else default_for_host
-        self._base_url = f"https://{self._host}{self._endpoint}"
+        self._configured_endpoint = settings.rapidapi_skyscanner_endpoint
+        self._discovered_endpoint: Optional[str] = None
+        self._probed = False
         self.enabled = bool(self._key)
-        self._logged_sample = False  # log one raw response per session to aid debugging
+        self._logged_sample = False
 
     def _headers(self) -> dict:
         return {
             "X-RapidAPI-Key": self._key,
             "X-RapidAPI-Host": self._host,
         }
+
+    async def _probe_endpoint(self, client: httpx.AsyncClient) -> Optional[str]:
+        """Try each candidate endpoint with a lightweight test query.
+
+        Returns the first endpoint that doesn't 404, or None if all fail.
+        Any response other than 404 (200, 400, 429, 500) means the path exists.
+        """
+        test_params = {
+            "origin": "MXP",
+            "destination": "LHR",
+            "date": "2026-07-01",
+            "adults": "1",
+            "currency": "EUR",
+        }
+
+        # If user explicitly set endpoint to something non-default, try it first
+        user_overrode = self._configured_endpoint != _DEFAULT_ENDPOINT
+        candidates = (
+            [self._configured_endpoint] if user_overrode
+            else _ENDPOINT_CANDIDATES
+        )
+
+        for endpoint in candidates:
+            url = f"https://{self._host}{endpoint}"
+            try:
+                resp = await client.get(url, params=test_params, headers=self._headers())
+                if resp.status_code != 404:
+                    log.info(
+                        "skyscanner_endpoint_discovered",
+                        endpoint=endpoint,
+                        status=resp.status_code,
+                        host=self._host,
+                    )
+                    return endpoint
+            except Exception:
+                continue
+
+        return None
 
     @async_retry(
         max_attempts=3, min_wait=2.0, max_wait=16.0,
@@ -57,6 +99,7 @@ class SkyscannerScraper(BaseFlightScraper):
     async def _search_one_pair(
         self,
         client: httpx.AsyncClient,
+        base_url: str,
         origin: str,
         destination: str,
         dep_date: date,
@@ -73,36 +116,33 @@ class SkyscannerScraper(BaseFlightScraper):
         if return_date:
             params["returnDate"] = return_date.strftime("%Y-%m-%d")
 
-        resp = await client.get(self._base_url, params=params, headers=self._headers())
+        resp = await client.get(base_url, params=params, headers=self._headers())
         resp.raise_for_status()
         data = resp.json()
 
-        # Log one raw sample per session so endpoint/format issues are visible
         if not self._logged_sample:
             self._logged_sample = True
             top_keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
             log.info(
                 "skyscanner_response_sample",
-                url=self._base_url,
+                url=base_url,
                 top_level_keys=top_keys,
                 preview=str(data)[:300],
             )
 
         results: List[RawFlightResult] = []
 
-        # Try the most common response shapes
         itineraries = (
-            data.get("data", {}).get("itineraries")          # shape A: {data:{itineraries:[]}}
-            or data.get("itineraries")                        # shape B: {itineraries:[]}
-            or data.get("data", {}).get("flights")            # shape C: {data:{flights:[]}}
-            or data.get("flights")                            # shape D: {flights:[]}
-            or data.get("results")                            # shape E: {results:[]}
+            data.get("data", {}).get("itineraries")
+            or data.get("itineraries")
+            or data.get("data", {}).get("flights")
+            or data.get("flights")
+            or data.get("results")
             or []
         )
 
         for item in itineraries:
             try:
-                # Shape A/B (Skyscanner-style)
                 price_raw = (
                     item.get("price", {}).get("raw")
                     or item.get("price", {}).get("amount")
@@ -142,14 +182,31 @@ class SkyscannerScraper(BaseFlightScraper):
 
     async def scrape(self, params: ScraperParams) -> List[RawFlightResult]:
         results: List[RawFlightResult] = []
-        tasks = []
         async with build_client(timeout=30.0) as client:
+            # Discover endpoint on first call
+            if not self._probed:
+                self._probed = True
+                self._discovered_endpoint = await self._probe_endpoint(client)
+                if not self._discovered_endpoint:
+                    log.error(
+                        "skyscanner_no_working_endpoint",
+                        host=self._host,
+                        hint="Set RAPIDAPI_SKYSCANNER_ENDPOINT in .env — check your RapidAPI console Endpoints tab",
+                    )
+                    self.enabled = False
+                    return results
+
+            if not self._discovered_endpoint:
+                return results
+
+            base_url = f"https://{self._host}{self._discovered_endpoint}"
+            tasks = []
             for origin in params.origins[:3]:
                 for dest in params.destinations[:10]:
                     dep = params.departure_date_from
                     ret_date = dep + timedelta(days=params.nights_min + 1) if params.nights_min else None
                     tasks.append(
-                        self._search_one_pair(client, origin, dest, dep, ret_date, params.adults)
+                        self._search_one_pair(client, base_url, origin, dest, dep, ret_date, params.adults)
                     )
             gathered = await asyncio.gather(*tasks, return_exceptions=True)
             for r in gathered:
