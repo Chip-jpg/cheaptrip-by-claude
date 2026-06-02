@@ -55,11 +55,11 @@ class TestHardFilters:
         assert len(instant) == 0
         assert len(digest) == 1
 
-    def test_very_expensive_trip_is_discarded(self):
+    def test_very_expensive_trip_goes_to_digest(self):
         trip = _make_flight_trip("MXP", "KRK", 999.0)
         instant, digest = apply_hard_filters([trip])
         assert len(instant) == 0
-        assert len(digest) == 0
+        assert len(digest) == 1
 
     def test_cheap_longhaul_is_instant(self):
         trip = _make_flight_trip("MXP", "JFK", 320.0)

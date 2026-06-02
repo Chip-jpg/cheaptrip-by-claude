@@ -30,7 +30,10 @@ def _is_europe_trip(trip: Trip) -> bool:
 def apply_hard_filters(trips: List[Trip]) -> Tuple[List[Trip], List[Trip]]:
     """
     Split trips into (instant_eligible, digest_eligible).
-    Trips that pass NO threshold are discarded.
+
+    Only truly invalid trips are discarded (zero cost, excluded destinations,
+    over-budget). Everything else goes to at least DIGEST tier so the user
+    sees what was found.
 
     Returns (instant, digest) — caller decides final send.
     """
@@ -46,18 +49,15 @@ def apply_hard_filters(trips: List[Trip]) -> Tuple[List[Trip], List[Trip]]:
             discarded += 1
             continue
 
-        # Excluded destinations: enforce on actual trip results (scrapers may return any airport)
         dest = trip.outbound_flight.destination if trip.outbound_flight else ""
         if dest and dest in excluded:
             discarded += 1
             continue
 
-        # User budget cap: discard trips above max_trip_budget if set
         if prefs.max_trip_budget and trip.total_cost_eur > prefs.max_trip_budget:
             discarded += 1
             continue
 
-        # Hotel quality gate: skip low-quality hotels unless big discount
         if (
             trip.hotel
             and not trip.hotel.meets_quality_threshold
@@ -70,23 +70,11 @@ def apply_hard_filters(trips: List[Trip]) -> Tuple[List[Trip], List[Trip]]:
         cost = trip.total_cost_eur
         discount = trip.discount_pct or 0.0
 
-        # Digest condition (reused below for infeasible trips)
-        passes_digest = (
-            (is_europe and cost < settings.europe_trip_max_eur * 2.5)
-            or (not is_europe and cost < settings.longhaul_trip_max_eur * 1.5)
-            or (discount >= 35.0)
-        )
-
-        # Infeasible trips are capped at DIGEST
         if not trip.is_feasible:
-            if passes_digest:
-                trip.alert_tier = AlertTier.DIGEST
-                digest.append(trip)
-            else:
-                discarded += 1
+            trip.alert_tier = AlertTier.DIGEST
+            digest.append(trip)
             continue
 
-        # Hard instant conditions
         passes_instant = (
             (is_europe and cost < settings.europe_trip_max_eur)
             or (not is_europe and cost < settings.longhaul_trip_max_eur)
@@ -98,13 +86,9 @@ def apply_hard_filters(trips: List[Trip]) -> Tuple[List[Trip], List[Trip]]:
         if passes_instant:
             trip.alert_tier = AlertTier.INSTANT
             instant.append(trip)
-            continue
-
-        if passes_digest:
+        else:
             trip.alert_tier = AlertTier.DIGEST
             digest.append(trip)
-        else:
-            discarded += 1
 
     log.info(
         "hard_filter_results",

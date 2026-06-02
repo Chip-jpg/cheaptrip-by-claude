@@ -144,6 +144,11 @@ async def run_pipeline_cycle() -> None:
             sent = await _notifier.process_instant_queue(new_instant)
             log.info("instant_alerts_sent", count=sent)
 
+        # ── Send cycle summary of best cheap finds ───────────────────────────
+        all_found = new_instant + new_digest
+        if all_found and not new_instant:
+            await _send_best_finds_summary(all_found)
+
         await _log_health_summary()
 
         duration = (datetime.utcnow() - cycle_start).total_seconds()
@@ -152,6 +157,23 @@ async def run_pipeline_cycle() -> None:
     except Exception as exc:
         log.error("pipeline_cycle_failed", error=str(exc), exc_info=True)
         # Do NOT crash the scheduler — just log
+
+
+async def _send_best_finds_summary(trips: list) -> None:
+    """Send a Telegram summary of the cheapest flights found this cycle."""
+    try:
+        sorted_trips = sorted(trips, key=lambda t: t.total_cost_eur)[:10]
+        lines = ["🔍 *Cycle Summary — Cheapest Finds*\n"]
+        for t in sorted_trips:
+            emoji = "✈️" if "FLIGHT" in str(t.deal_type) else "🏨"
+            lines.append(f"{emoji} {t.route} — *€{t.total_cost_eur:.0f}*")
+            airline = t.outbound_flight.airline if t.outbound_flight else None
+            if airline:
+                lines[-1] += f" ({airline})"
+        lines.append(f"\n_{len(trips)} total deals found this cycle_")
+        await _notifier.send_system_message("\n".join(lines))
+    except Exception as exc:
+        log.debug("best_finds_summary_failed", error=str(exc))
 
 
 async def _log_health_summary() -> None:
