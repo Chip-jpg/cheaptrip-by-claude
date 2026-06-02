@@ -25,11 +25,21 @@ class SkyscannerScraper(BaseFlightScraper):
 
     source_id = "skyscanner_api"
 
+    # Known endpoint paths per RapidAPI host
+    _HOST_ENDPOINTS: dict = {
+        "skyscanner50.p.rapidapi.com":                    "/api/v1/searchFlights",
+        "skyscanner-flights-travel-api.p.rapidapi.com":   "/api/v1/flights/searchFlights",
+        "sky-scrapper.p.rapidapi.com":                    "/api/v2/flights/searchFlights",
+    }
+
     def __init__(self) -> None:
         settings = get_settings()
         self._key = settings.rapidapi_key
         self._host = settings.rapidapi_skyscanner_host
-        self._endpoint = settings.rapidapi_skyscanner_endpoint
+        # Use per-host default unless the user explicitly overrode it in .env
+        configured = settings.rapidapi_skyscanner_endpoint
+        default_for_host = self._HOST_ENDPOINTS.get(self._host, configured)
+        self._endpoint = configured if configured != "/api/v1/searchFlights" else default_for_host
         self._base_url = f"https://{self._host}{self._endpoint}"
         self.enabled = bool(self._key)
         self._logged_sample = False  # log one raw response per session to aid debugging
@@ -40,7 +50,10 @@ class SkyscannerScraper(BaseFlightScraper):
             "X-RapidAPI-Host": self._host,
         }
 
-    @async_retry(max_attempts=3, min_wait=2.0, max_wait=16.0)
+    @async_retry(
+        max_attempts=3, min_wait=2.0, max_wait=16.0,
+        retry_on=(httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError),
+    )
     async def _search_one_pair(
         self,
         client: httpx.AsyncClient,

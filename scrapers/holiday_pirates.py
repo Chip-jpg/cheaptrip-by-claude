@@ -16,18 +16,20 @@ from utils.retry import async_retry
 log = get_logger(__name__)
 
 _BASE = "https://www.holidaypirates.com"
-# Try root paths first; /en/ locale prefix often redirects or 404s
+# holidaypirates.com restructured their URL layout; try multiple known patterns
 _FLIGHT_CANDIDATES = [
+    f"{_BASE}/en/flight-deals",
+    f"{_BASE}/en/flights",
+    f"{_BASE}/en/",
     f"{_BASE}/deals?category=flight",
     f"{_BASE}/flights",
-    f"{_BASE}/en/deals?category=flight",
-    f"{_BASE}/deals",
 ]
 _HOTEL_CANDIDATES = [
+    f"{_BASE}/en/hotel-deals",
+    f"{_BASE}/en/hotels",
+    f"{_BASE}/en/",
     f"{_BASE}/deals?category=hotel",
     f"{_BASE}/hotels",
-    f"{_BASE}/en/deals?category=hotel",
-    f"{_BASE}/deals",
 ]
 
 _AIRPORT_RE = re.compile(r"\b([A-Z]{3})\b")
