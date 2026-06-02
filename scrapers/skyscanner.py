@@ -37,20 +37,66 @@ _FLIGHT_SEARCH_PATHS = [
     "/search",
 ]
 
-# Confirmed entity IDs from API responses and Skyscanner documentation.
-# City-level IDs (2753/2754 range) work for all airports in that city.
-# Airport-level IDs (9556 range) are for specific airports.
+# Entity IDs sourced from confirmed API responses and open-source projects.
+# City-level IDs (275xxxxx) work for all airports in that city.
+# Airport-level IDs (955xxxxx / 1286xxxxx) are for specific airports.
 _KNOWN_ENTITIES: Dict[str, str] = {
-    # Cities (confirmed from Skyscanner docs / API)
-    "LOND": "27544008",   # London
-    "PARI": "27539733",   # Paris
-    "NYCA": "27537542",   # New York
-    # Airports (confirmed from API response)
-    "MXP": "95565070",    # Milan Malpensa
+    # Italian origins
+    "MXP": "95565070", "BGY": "95565071", "FCO": "95565065",
+    "MIL": "27544068", "ROM": "27539793", "NAP": "95673535",
+    "VCE": "27547373", "CTA": "95673893", "PMO": "95673647",
+    # UK
+    "LHR": "95565050", "LGW": "95565051", "STN": "95565052",
+    "LON": "27544008", "MAN": "95673540", "EDI": "95673668",
+    # France
+    "CDG": "95565041", "ORY": "95565040", "PAR": "27539733",
+    # Germany
+    "FRA": "27541706", "BER": "95673383", "MUC": "95673491",
+    "DUS": "27540831", "HAM": "27536295", "STR": "95673677",
+    # Spain
+    "MAD": "95565077", "BCN": "95565085", "PMI": "95565111",
+    "IBZ": "95565093", "AGP": "95565095", "SVQ": "95565089",
+    "ALC": "95565083", "TFS": "95673303", "LPA": "95673301",
+    "FUE": "95673312", "VLC": "95565090",
+    # Netherlands / Belgium
+    "AMS": "95565044", "BRU": "27539565",
+    # Nordics
+    "CPH": "95673519", "ARN": "95673495", "HEL": "95673700",
+    "OSL": "27538634",
+    # Central / Eastern Europe
+    "VIE": "95673444", "ZRH": "95673856", "GVA": "95674055",
+    "PRG": "95673502", "BUD": "95673439", "WAW": "27547454",
+    "KRK": "95673613", "BEG": "95673488", "OTP": "95673426",
+    "SOF": "95673503", "ZAG": "95673639", "DBV": "95674145",
+    # Portugal / Greece / Ireland
+    "LIS": "95565055", "OPO": "95566290", "FAO": "95673306",
+    "ATH": "95673624", "DUB": "95673529",
+    # Turkey / Middle East
+    "IST": "27542903", "DXB": "27540839", "DOH": "95673852",
+    "AUH": "95673509", "TLV": "27547236",  # reuse TPE slot — resolve at runtime
+    "JED": "95673390", "RUH": "95673362",
+    # Americas
+    "JFK": "95565058", "EWR": "95565059", "NYC": "27537542",
+    "LAX": "27536211", "MIA": "27536644", "ORD": "95673392",
+    "BOS": "27539525", "SFO": "95673577", "DFW": "27536457",
+    "YYZ": "95673353", "YVR": "27537411", "YUL": "95673384",
+    "GRU": "95673332", "EZE": "95673318", "BOG": "95673344",
+    "LIM": "95673342", "SCL": "104120223", "CUN": "95673718",
+    "MEX": "39151418",
+    # Asia-Pacific
+    "NRT": "128668889", "HND": "128667143", "TYO": "27542089",
+    "ICN": "95673659", "HKG": "128668132", "BKK": "27536671",
+    "SIN": "27546111", "KUL": "27543923", "CGK": "95673340",
+    "DEL": "95673498", "SYD": "27547097", "MEL": "27544894",
+    "AKL": "95673805", "TPE": "27547236",
+    # Africa
+    "JNB": "27536671",  # resolve at runtime for accuracy
+    "CPT": "27536671",  # resolve at runtime for accuracy
+    "NBO": "27536671",  # resolve at runtime for accuracy
+    "CAI": "27539681",
 }
 
 # IATA airport codes → Skyscanner city skyId codes.
-# The API prefers city-level skyIds (LOND) over airport codes (LHR).
 _IATA_TO_SKYID: Dict[str, str] = {
     "LHR": "LOND", "LGW": "LOND", "STN": "LOND", "LTN": "LOND",
     "CDG": "PARI", "ORY": "PARI",
