@@ -211,6 +211,37 @@ async def record_price(route: str, price_eur: float, source: str) -> None:
         await db.commit()
 
 
+async def get_recent_alert_timestamps(tier: AlertTier, within_hours: float) -> list:
+    """Return UTC datetimes of alerts sent for this tier within the given window."""
+    path = await get_db_path()
+    cutoff = (datetime.utcnow() - timedelta(hours=within_hours)).isoformat()
+    async with aiosqlite.connect(path) as db:
+        cursor = await db.execute(
+            "SELECT sent_at FROM alerts_sent WHERE alert_tier = ? AND sent_at >= ?",
+            (tier, cutoff),
+        )
+        rows = await cursor.fetchall()
+    return [datetime.fromisoformat(r[0]) for r in rows]
+
+
+async def was_route_alerted_recently(route: str, within_hours: float = 6.0) -> bool:
+    """True if any deal on this exact route was alerted within the window."""
+    path = await get_db_path()
+    cutoff = (datetime.utcnow() - timedelta(hours=within_hours)).isoformat()
+    async with aiosqlite.connect(path) as db:
+        cursor = await db.execute(
+            """
+            SELECT 1 FROM alerts_sent a
+            JOIN deals d ON a.hash = d.hash
+            WHERE d.route = ? AND a.sent_at >= ?
+            LIMIT 1
+            """,
+            (route, cutoff),
+        )
+        row = await cursor.fetchone()
+    return row is not None
+
+
 async def get_price_median(route: str, lookback_days: int = 30) -> Optional[float]:
     path = await get_db_path()
     cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).isoformat()

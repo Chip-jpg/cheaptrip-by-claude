@@ -12,7 +12,7 @@ from ai_layer.formatter import (
 )
 from config import get_settings
 from notifier.rate_limiter import RateLimiter
-from storage.database import count_alerts_sent_last_hour, mark_alerted
+from storage.database import count_alerts_sent_last_hour, mark_alerted, was_route_alerted_recently
 from storage.models import AlertTier, Trip
 from utils.logging_config import get_logger
 from utils.retry import async_retry
@@ -36,8 +36,15 @@ class TelegramNotifier:
         settings = get_settings()
         self._token = settings.telegram_bot_token
         self._chat_id = settings.telegram_chat_id
-        self._rate_limiter = RateLimiter()
+        self._rate_limiter = RateLimiter()  # sync init; call create() for DB-restored state
         self.enabled = bool(self._token and self._chat_id)
+
+    @classmethod
+    async def create(cls) -> "TelegramNotifier":
+        """Async factory — creates a TelegramNotifier with a DB-restored rate limiter."""
+        notifier = cls()
+        notifier._rate_limiter = await RateLimiter.create()
+        return notifier
 
     @async_retry(max_attempts=4, min_wait=2.0, max_wait=16.0)
     async def _send_raw(self, text: str, parse_mode: str = "Markdown") -> bool:
@@ -76,6 +83,10 @@ class TelegramNotifier:
 
         if not await self._rate_limiter.can_send_instant():
             log.info("rate_limit_instant_skipped", route=trip.route)
+            return False
+
+        if await was_route_alerted_recently(trip.route, within_hours=6.0):
+            log.info("route_recently_alerted_suppressed", route=trip.route)
             return False
 
         formatter = select_formatter(trip)

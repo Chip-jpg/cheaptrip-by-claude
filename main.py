@@ -82,6 +82,17 @@ def status() -> None:
                 cur = await db.execute("SELECT COUNT(*) FROM price_stats")
                 price_stats = (await cur.fetchone())[0]
 
+                cur = await db.execute("""
+                    SELECT route, COUNT(*) as n,
+                           ROUND(AVG(price_eur), 0) as avg,
+                           ROUND(MIN(price_eur), 0) as low
+                    FROM price_history
+                    GROUP BY route
+                    ORDER BY n DESC
+                    LIMIT 10
+                """)
+                top_routes = await cur.fetchall()
+
             click.echo(f"""
 Travel Deal Intelligence Engine — Status
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -93,6 +104,14 @@ Price records:    {prices}
 Price stat routes:{price_stats}
 Alerts sent:      {alerts_sent}
 """)
+            if top_routes:
+                click.echo("Top tracked routes (by observation count):")
+                click.echo(f"  {'Route':<20} {'Count':>6}  {'Avg €':>7}  {'Low €':>7}")
+                click.echo("  " + "─" * 46)
+                for row in top_routes:
+                    click.echo(f"  {row[0]:<20} {row[1]:>6}  {row[2]:>7}  {row[3]:>7}")
+            else:
+                click.echo("No price history yet (run a cycle first).")
         except Exception as exc:
             click.echo(f"DB not found or not initialized: {exc}")
             click.echo("Run 'python main.py cycle' to initialize.")

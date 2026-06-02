@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List, Tuple
 
 from config import get_settings
+from preferences import get_preferences
 from storage.models import AlertTier, DealType, Trip
 from utils.logging_config import get_logger
 
@@ -34,12 +35,18 @@ def apply_hard_filters(trips: List[Trip]) -> Tuple[List[Trip], List[Trip]]:
     Returns (instant, digest) — caller decides final send.
     """
     settings = get_settings()
+    prefs = get_preferences()
     instant: List[Trip] = []
     digest: List[Trip] = []
     discarded = 0
 
     for trip in trips:
         if trip.total_cost_eur <= 0:
+            discarded += 1
+            continue
+
+        # User budget cap: discard trips above max_trip_budget if set
+        if prefs.max_trip_budget and trip.total_cost_eur > prefs.max_trip_budget:
             discarded += 1
             continue
 

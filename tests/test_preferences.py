@@ -84,6 +84,10 @@ class TestLoadPreferences:
         prefs = UserPreferences()
         assert prefs.excluded_destinations == []
 
+    def test_priority_destinations_default_empty(self):
+        prefs = UserPreferences()
+        assert prefs.priority_destinations == []
+
     def test_custom_excluded_destinations(self):
         data = {"excluded_destinations": ["DXB", "LAS"]}
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:

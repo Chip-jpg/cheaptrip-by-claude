@@ -36,6 +36,8 @@ class UserPreferences(BaseModel):
 
     min_hotel_review_count: Optional[int] = None  # None = no minimum
 
+    priority_destinations: List[str] = Field(default_factory=list)
+
 
 def load_preferences(path: Path = _DEFAULT_YAML_PATH) -> UserPreferences:
     """Load preferences from YAML; return defaults if file is absent or malformed."""

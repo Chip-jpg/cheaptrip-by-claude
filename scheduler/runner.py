@@ -27,6 +27,8 @@ from utils.logging_config import get_logger
 
 log = get_logger(__name__)
 
+# Notifier is initialized async in run_forever() to restore rate-limiter state from DB.
+# Fallback sync init is used for cycle/search commands that don't go through run_forever().
 _notifier = TelegramNotifier()
 _aggregator = ScraperAggregator()
 
@@ -51,7 +53,8 @@ async def run_pipeline_cycle() -> None:
 
         # Cluster-expand home airports from preferences
         origins = expand_list_to_clusters(prefs.home_airports)
-        destinations = POPULAR_DESTINATIONS
+        excluded = set(prefs.excluded_destinations)
+        destinations = [d for d in POPULAR_DESTINATIONS if d not in excluded]
 
         # Generate flexible date windows based on preferred trip lengths
         param_batches = generate_search_windows(
@@ -198,6 +201,10 @@ async def run_forever() -> None:
     """
     await init_db()
     log.info("database_initialized")
+
+    # Re-initialize notifier now that DB is ready — restores rate-limiter state
+    global _notifier
+    _notifier = await TelegramNotifier.create()
 
     prefs = get_preferences()
     scheduler = create_scheduler()

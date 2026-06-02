@@ -103,6 +103,44 @@ async def get_price_stats(route: str) -> PriceStats:
     )
 
 
+async def update_price_stats(route: str) -> None:
+    """Recompute and upsert aggregated stats for a route into the price_stats table."""
+    prices_30d = await _fetch_prices(route, 30)
+    prices_90d = await _fetch_prices(route, 90)
+    all_prices = await _fetch_prices(route)
+    if not all_prices:
+        return
+
+    avg_30d = _mean(prices_30d)
+    avg_90d = _mean(prices_90d)
+    all_time_low = min(all_prices)
+    std_dev_30d = _std_dev(prices_30d)
+    now = datetime.utcnow().isoformat()
+
+    path = await get_db_path()
+    async with aiosqlite.connect(path) as db:
+        await db.execute(
+            """
+            INSERT INTO price_stats
+                (route, all_time_low, avg_30d, avg_90d, std_dev_30d, sample_count, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(route) DO UPDATE SET
+                all_time_low  = excluded.all_time_low,
+                avg_30d       = excluded.avg_30d,
+                avg_90d       = excluded.avg_90d,
+                std_dev_30d   = excluded.std_dev_30d,
+                sample_count  = excluded.sample_count,
+                last_updated  = excluded.last_updated
+            """,
+            (route, all_time_low,
+             round(avg_30d, 2) if avg_30d else None,
+             round(avg_90d, 2) if avg_90d else None,
+             round(std_dev_30d, 2) if std_dev_30d else None,
+             len(all_prices), now),
+        )
+        await db.commit()
+
+
 async def detect_anomaly(route: str, current_price: float) -> AnomalyResult:
     settings = get_settings()
     stats = await get_price_stats(route)

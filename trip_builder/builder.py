@@ -6,6 +6,7 @@ from typing import List, Optional
 
 from config import LAYER_1_AIRPORTS, LAYER_2_AIRPORTS, LAYER_3_HUBS
 from storage.database import get_price_median, record_price
+from storage.price_analytics import detect_anomaly, update_price_stats
 from storage.models import (
     AlertTier,
     BookingConfidence,
@@ -15,7 +16,6 @@ from storage.models import (
     Trip,
     TripLengthProfile,
 )
-from storage.price_analytics import detect_anomaly
 from trip_builder.categorizer import categorize_trip
 from trip_builder.cost_calculator import (
     assign_verdict,
@@ -113,10 +113,11 @@ async def build_trips(
     """
     trips: List[Trip] = []
 
-    # Record prices for historical tracking
+    # Record prices for historical tracking and keep price_stats fresh
     for leg in flight_legs:
         route = f"{leg.origin}-{leg.destination}"
         await record_price(route, leg.price_eur, leg.source)
+        await update_price_stats(route)
 
     # ── 1. Direct flight-only deals ──────────────────────────────────────────
     for leg in flight_legs:
@@ -295,12 +296,17 @@ async def _build_repositioned_trip(
 
 def _assign_alert_tier(trip: Trip) -> AlertTier:
     from config import get_settings
+    from preferences import get_preferences
     settings = get_settings()
+    prefs = get_preferences()
 
     cost = trip.total_cost_eur
-    is_europe = _is_europe(
-        trip.outbound_flight.destination if trip.outbound_flight else ""
-    )
+    dest = trip.outbound_flight.destination if trip.outbound_flight else ""
+    is_europe = _is_europe(dest)
+
+    # Priority wishlist: always instant regardless of price
+    if dest and dest in prefs.priority_destinations:
+        return AlertTier.INSTANT
 
     # Instant alert conditions
     if is_europe and cost < settings.europe_trip_max_eur:

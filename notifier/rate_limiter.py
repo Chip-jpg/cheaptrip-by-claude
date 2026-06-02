@@ -19,6 +19,9 @@ class RateLimiter:
     - Instant alerts: max 5/hour
     - Digest: 1/day
     - No duplicate alerts ever (handled by dedup layer)
+
+    State is persisted via alerts_sent DB table and restored on startup,
+    so quotas survive engine restarts.
     """
 
     def __init__(self) -> None:
@@ -27,6 +30,31 @@ class RateLimiter:
         self._instant_sent: Deque[datetime] = deque()
         self._digest_sent: Deque[datetime] = deque()
         self._lock = asyncio.Lock()
+
+    @classmethod
+    async def create(cls) -> "RateLimiter":
+        """Async factory — creates a RateLimiter pre-populated from DB history."""
+        rl = cls()
+        try:
+            from storage.database import get_recent_alert_timestamps
+            from storage.models import AlertTier
+
+            instant_ts = await get_recent_alert_timestamps(AlertTier.INSTANT, 1.0)
+            for ts in instant_ts:
+                rl._instant_sent.append(ts)
+
+            digest_ts = await get_recent_alert_timestamps(AlertTier.DIGEST, 24.0)
+            for ts in digest_ts:
+                rl._digest_sent.append(ts)
+
+            log.info(
+                "rate_limiter_restored",
+                instant_in_last_hour=len(instant_ts),
+                digest_in_last_day=len(digest_ts),
+            )
+        except Exception as exc:
+            log.warning("rate_limiter_restore_failed", error=str(exc))
+        return rl
 
     def _prune_old(self, queue: Deque[datetime], window: timedelta) -> None:
         cutoff = datetime.utcnow() - window
