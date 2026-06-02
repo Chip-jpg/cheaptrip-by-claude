@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from datetime import date, timedelta
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import httpx
 
@@ -15,6 +18,9 @@ from utils.retry import async_retry
 log = get_logger(__name__)
 
 _DEFAULT_ENDPOINT = "/api/v1/searchFlights"
+_CACHE_PATH = Path("data/skyscanner_cache.json")
+_PROBE_TTL_SECONDS = 3600  # re-probe endpoints every hour
+_ENTITY_TTL_SECONDS = 86400 * 7  # entity IDs are stable, cache for a week
 
 _AIRPORT_SEARCH_PATHS = [
     "/flights/searchAirport",
@@ -74,7 +80,6 @@ _IATA_TO_CITY: Dict[str, str] = {
 
 
 def _deep_find_entity_id(obj: object) -> Optional[str]:
-    """Recursively search a dict for any key named 'entityId' or 'entity_id'."""
     if not isinstance(obj, dict):
         return None
     for key in ("entityId", "entity_id"):
@@ -89,15 +94,30 @@ def _deep_find_entity_id(obj: object) -> Optional[str]:
     return None
 
 
+# ── Disk cache ──────────────────────────────────────────────────────────────
+
+def _load_cache() -> dict:
+    try:
+        if _CACHE_PATH.exists():
+            return json.loads(_CACHE_PATH.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_cache(data: dict) -> None:
+    try:
+        _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CACHE_PATH.write_text(json.dumps(data, indent=2))
+    except Exception as exc:
+        log.debug("skyscanner_cache_write_failed", error=str(exc))
+
+
 class SkyscannerScraper(BaseFlightScraper):
-    """Skyscanner via RapidAPI.
+    """Skyscanner via RapidAPI with persistent cache.
 
-    On first call, discovers the working API contract in two phases:
-    1. Find the airport-search endpoint and resolve IATA → entity IDs
-    2. Find the flight-search endpoint using resolved entity IDs
-
-    Many RapidAPI Skyscanner providers require both sky IDs (IATA codes)
-    and numeric entity IDs. Without entity IDs, the search returns 422.
+    Caches discovered endpoints (1-hour TTL) and entity IDs (7-day TTL)
+    to disk so restarts don't waste API calls on re-probing.
     """
 
     source_id = "skyscanner_api"
@@ -114,6 +134,55 @@ class SkyscannerScraper(BaseFlightScraper):
         self.enabled = bool(self._key)
         self._logged_sample = False
         self._logged_airport_sample = False
+
+        self._restore_from_cache()
+
+    def _restore_from_cache(self) -> None:
+        cache = _load_cache()
+        if not cache:
+            return
+
+        now = time.time()
+
+        # Restore entity IDs (long TTL — airports don't change)
+        entities = cache.get("entities", {})
+        entities_ts = cache.get("entities_cached_at", 0)
+        if entities and (now - entities_ts) < _ENTITY_TTL_SECONDS:
+            self._entity_cache = entities
+            log.info("skyscanner_cache_entities_loaded", count=len(entities))
+
+        # Restore endpoints (short TTL — re-probe hourly)
+        probe_ts = cache.get("probe_cached_at", 0)
+        if (now - probe_ts) < _PROBE_TTL_SECONDS:
+            airport_ep = cache.get("airport_endpoint")
+            search_ep = cache.get("search_endpoint")
+            if search_ep:
+                self._airport_endpoint = airport_ep
+                self._search_endpoint = search_ep
+                self._probed = True
+                log.info(
+                    "skyscanner_cache_endpoints_loaded",
+                    airport=airport_ep,
+                    search=search_ep,
+                    age_min=round((now - probe_ts) / 60, 1),
+                )
+
+    def _persist_cache(self) -> None:
+        now = time.time()
+        existing = _load_cache()
+
+        # Merge entity caches — keep accumulated IDs from previous runs
+        merged_entities = existing.get("entities", {})
+        merged_entities.update(self._entity_cache)
+
+        _save_cache({
+            "airport_endpoint": self._airport_endpoint,
+            "search_endpoint": self._search_endpoint,
+            "probe_cached_at": now,
+            "entities": merged_entities,
+            "entities_cached_at": now,
+            "host": self._host,
+        })
 
     def _headers(self) -> dict:
         return {
@@ -148,6 +217,7 @@ class SkyscannerScraper(BaseFlightScraper):
         entity_id = await self._try_resolve(client, iata)
         if entity_id:
             self._entity_cache[iata] = entity_id
+            self._persist_cache()
             return entity_id
 
         city = _IATA_TO_CITY.get(iata)
@@ -155,6 +225,7 @@ class SkyscannerScraper(BaseFlightScraper):
             entity_id = await self._try_resolve(client, city)
             if entity_id:
                 self._entity_cache[iata] = entity_id
+                self._persist_cache()
                 return entity_id
 
         log.debug("skyscanner_entity_not_found", iata=iata)
@@ -300,6 +371,10 @@ class SkyscannerScraper(BaseFlightScraper):
         self._search_endpoint = await self._probe_search_endpoint(
             client, origin_entity, dest_entity,
         )
+
+        if self._search_endpoint:
+            self._persist_cache()
+
         return self._search_endpoint is not None
 
     # ── Actual search ───────────────────────────────────────────────────────
